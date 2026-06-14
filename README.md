@@ -43,13 +43,26 @@ Configuration is done via the Home Assistant UI. You must have your Kelvinator A
 1. In Home Assistant, go to **Settings → Devices & Services**
 2. Click **Add Integration** (blue button, bottom-right)
 3. Search for **Kelvinator Home Comfort** and select it
-4. Enter your Kelvinator app credentials:
+4. **Step 1 — Account**: Enter your Kelvinator app credentials:
    - **Username**: The email or phone number you use to log into the Kelvinator app
    - **Password**: Your Kelvinator app password
    - **Country Code**: `61` for Australia, `64` for New Zealand (default: `61`)
    - **Poll Interval**: How often to refresh device state in seconds (default: `30`)
-5. Click **Submit** — the integration will validate your credentials and discover devices on your LAN
-6. Your climate entities should appear as `climate.kelvinator_xxxx`
+   - **Enable LAN Discovery**: Leave ON to auto-discover devices via UDP broadcast
+5. **Step 2 — Device IPs**: Enter all your AC unit IP addresses, separated by commas:
+   - Example: `192.168.1.50, 192.168.1.51`
+   - Leave blank if you only want to use LAN discovery
+   - Each IP is probed during setup to verify the device responds
+6. Click **Submit** — the integration discovers your devices and creates climate entities
+
+### Managing Devices Post-Setup
+
+To add or remove IPs after initial setup:
+
+1. Go to **Settings → Devices & Services → Kelvinator Home Comfort**
+2. Click the **⋮** menu → **Configure**
+3. Edit the comma-separated IP list and click **Submit**
+4. The integration reloads automatically — no restart needed
 
 ## Troubleshooting
 
@@ -57,12 +70,14 @@ Configuration is done via the Home Assistant UI. You must have your Kelvinator A
 
 - Make sure the AC unit is powered on and connected to Wi-Fi
 - The AC and your Home Assistant machine must be on the **same subnet** (UDP discovery doesn't cross VLANs)
+- Try entering the AC's IP address in the **Device IPs** field during setup
 - Try restarting the AC unit
 
-### Login failed
+### Device not responding
 
-- Verify the username and password match what you use in the Kelvinator phone app
-- If using a phone number, make sure the country code is correct (`61` = Australia, `64` = New Zealand)
+- Verify the AC unit is powered on and the IP address hasn't changed
+- Check your router's DHCP reservation — assign a static IP to avoid changes
+- Use the **Configure** option on the integration to update IPs as needed
 
 ### Device shows as unavailable
 
@@ -111,6 +126,7 @@ Configuration is done via the Home Assistant UI. You must have your Kelvinator A
 - [python-broadlink](https://github.com/mjg59/python-broadlink) (`>=0.19.0`)
 - [pycryptodome](https://pypi.org/project/pycryptodome/) (`>=3.20.0`)
 - Kelvinator AC unit on the same LAN as Home Assistant
+- BroadLink cloud account (same credentials used in the Kelvinator app)
 
 ## Change Log
 
@@ -130,56 +146,3 @@ This project is licensed under the GNU General Public License v3.0 — see [LICE
 [license]: LICENSE
 [hacsbadge]: https://img.shields.io/badge/HACS-Custom-orange.svg
 [hacs]: https://github.com/hacs/integration
-3. Click **Kelvinator Home Comfort** → **Install**
-4. Configure the options (see below)
-5. Start the add-on
-
-## Configuration
-
-```yaml
-username: "your@email.com"    # Kelvinator app login
-password: "your_password"     # Kelvinator app password
-country_code: "61"            # Your country code (61=AU, 64=NZ)
-poll_interval: 30             # Status refresh interval (seconds)
-debug: false                  # Enable debug logging
-```
-
-MQTT settings are auto-detected from the HA supervisor. You can override them:
-
-```yaml
-mqtt_host: "192.168.1.10"
-mqtt_port: 1883
-mqtt_username: "mqtt_user"
-mqtt_password: "mqtt_pass"
-```
-
-## Supported Commands
-
-| Command | Values |
-|---------|--------|
-| Power | ON / OFF |
-| Mode | cool, heat, dry, fan_only, auto, eco |
-| Temperature | 16–30 °C |
-| Fan Speed | auto, low, medium, high, turbo, quiet |
-| Swing | off, vertical, horizontal, both |
-| Display | ON / OFF |
-| Sleep | ON / OFF |
-| ECO | ON / OFF |
-
-## Requirements
-
-- Home Assistant with MQTT broker (Mosquitto add-on recommended)
-- Kelvinator AC unit with BroadLink WiFi module
-- AC unit on same LAN as Home Assistant for best performance
-
-## Troubleshooting
-
-**No devices discovered**: Ensure your AC is on the same WiFi network as HA. Try power-cycling the AC.
-
-**Connection errors**: The BroadLink module uses UDP broadcast for discovery. Ensure your network allows UDP on port 80.
-
-**Wrong temperature range**: The add-on reads min/max from the device profile. If incorrect, check the device model number.
-
-## License
-
-GPL3

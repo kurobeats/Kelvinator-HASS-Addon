@@ -12,7 +12,8 @@ CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
 CONF_COUNTRY_CODE = "country_code"
 CONF_POLL_INTERVAL = "poll_interval"
-CONF_DEVICE_HOST = "device_host"
+CONF_DEVICE_HOSTS = "device_hosts"
+CONF_ENABLE_DISCOVERY = "enable_discovery"
 
 DEFAULT_POLL_INTERVAL = 30
 DEFAULT_COUNTRY_CODE = "61"
