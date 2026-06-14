@@ -7,6 +7,8 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+release/
+tests/
 .Python
 build/
 develop-eggs/
@@ -216,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Test scrips
+tests/

@@ -22,8 +22,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     username: str = entry.data["username"]
     password: str = entry.data["password"]
     country_code: str = entry.data.get("country_code", "61")
-    poll_interval: int = entry.data.get("poll_interval", 30)
-    device_host: str = entry.data.get("device_host", "")
+    poll_interval: int = entry.options.get("poll_interval", entry.data.get("poll_interval", 30))
+    device_hosts: list[str] = entry.options.get("device_hosts", entry.data.get("device_hosts", []))
+    enable_discovery: bool = entry.options.get("enable_discovery", entry.data.get("enable_discovery", True))
 
     coordinator = KelvinatorCoordinator(
         hass,
@@ -31,7 +32,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         password=password,
         country_code=country_code,
         poll_interval=poll_interval,
-        device_host=device_host,
+        device_hosts=device_hosts,
+        enable_discovery=enable_discovery,
     )
 
     # Run initial discovery and first refresh
@@ -43,7 +45,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # Register listener so options changes (add/remove IPs) take effect
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
     return True
+
+
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload config entry when options change (device IPs added/removed)."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
