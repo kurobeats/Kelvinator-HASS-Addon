@@ -20,7 +20,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
-from .api import probe_device
+from .api import BroadLinkCloudClient, probe_device
 from .const import (
     CONF_COUNTRY_CODE,
     CONF_DEVICE_HOSTS,
@@ -67,10 +67,41 @@ class KelvinatorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Step 1: collect account credentials."""
+        """Step 1: collect account credentials and validate against cloud."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            # Validate credentials against BroadLink cloud
+            try:
+                cloud = BroadLinkCloudClient(
+                    country_code=user_input.get(CONF_COUNTRY_CODE, DEFAULT_COUNTRY_CODE),
+                )
+                result = await cloud.login(
+                    user_input[CONF_USERNAME],
+                    user_input[CONF_PASSWORD],
+                )
+                await cloud.close()
+                _LOGGER.info(
+                    "Cloud login OK: uid=%s nickname=%s",
+                    result.get("userid"), result.get("nickname"),
+                )
+            except RuntimeError as exc:
+                _LOGGER.warning("Login validation failed: %s", exc)
+                errors["base"] = "invalid_auth"
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=STEP_ACCOUNT_SCHEMA,
+                    errors=errors,
+                )
+            except Exception as exc:
+                _LOGGER.error("Unexpected error during validation: %s", exc)
+                errors["base"] = "cannot_connect"
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=STEP_ACCOUNT_SCHEMA,
+                    errors=errors,
+                )
+
             self._account_data = user_input
             return await self.async_step_devices()
 
