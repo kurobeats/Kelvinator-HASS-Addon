@@ -23,6 +23,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     password: str = entry.data["password"]
     country_code: str = entry.data.get("country_code", "61")
     poll_interval: int = entry.data.get("poll_interval", 30)
+    device_host: str = entry.data.get("device_host", "")
 
     coordinator = KelvinatorCoordinator(
         hass,
@@ -30,6 +31,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         password=password,
         country_code=country_code,
         poll_interval=poll_interval,
+        device_host=device_host,
     )
 
     # Run initial discovery and first refresh

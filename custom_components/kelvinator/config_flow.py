@@ -15,8 +15,10 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.data_entry_flow import FlowResult
 
+from .api import BroadLinkCloudClient
 from .const import (
     CONF_COUNTRY_CODE,
+    CONF_DEVICE_HOST,
     CONF_POLL_INTERVAL,
     DEFAULT_COUNTRY_CODE,
     DEFAULT_POLL_INTERVAL,
@@ -35,6 +37,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Required(CONF_PASSWORD): str,
         vol.Optional(CONF_COUNTRY_CODE, default=DEFAULT_COUNTRY_CODE): str,
         vol.Optional(CONF_POLL_INTERVAL, default=DEFAULT_POLL_INTERVAL): int,
+        vol.Optional(CONF_DEVICE_HOST, default=""): str,
     }
 )
 
@@ -51,17 +54,32 @@ class KelvinatorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            # Credentials are stored for future cloud relay support.
-            # The integration works via LAN discovery (no cloud required).
-            await self.async_set_unique_id(
-                f"kelvinator_{user_input[CONF_USERNAME]}"
-            )
-            self._abort_if_unique_id_configured()
+            # Validate credentials against BroadLink cloud
+            try:
+                cloud = BroadLinkCloudClient(
+                    country_code=user_input.get(CONF_COUNTRY_CODE, DEFAULT_COUNTRY_CODE),
+                )
+                await cloud.login(
+                    user_input[CONF_USERNAME],
+                    user_input[CONF_PASSWORD],
+                )
+                await cloud.close()
+            except RuntimeError as exc:
+                _LOGGER.warning("Login validation failed: %s", exc)
+                errors["base"] = "invalid_auth"
+            except Exception as exc:
+                _LOGGER.error("Unexpected error during validation: %s", exc)
+                errors["base"] = "cannot_connect"
+            else:
+                await self.async_set_unique_id(
+                    f"kelvinator_{user_input[CONF_USERNAME]}"
+                )
+                self._abort_if_unique_id_configured()
 
-            return self.async_create_entry(
-                title="Kelvinator Home Comfort",
-                data=user_input,
-            )
+                return self.async_create_entry(
+                    title="Kelvinator Home Comfort",
+                    data=user_input,
+                )
 
         return self.async_show_form(
             step_id="user",
