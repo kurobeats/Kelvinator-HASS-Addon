@@ -32,12 +32,14 @@ PASSWORD_SALT = "4969fj#k23#"
 KEY_PERMUTATION = [7, 12, 3, 0, 11, 15, 2, 4, 5, 9, 14, 1, 13, 10, 8, 6]
 DEFAULT_LICENSE_ID = "bddb4af53f74edaa03b1aa439b75e7a6"
 
-# Full base64 License from AirApplication.java — used as companyid for account login
+# Full base64 License from AirApplication.java — bytes 120:136 = companyid
 FULL_LICENSE = (
     "vdtK9T907aoDsapDm3Xnpviv67CfTNVaCnBaVHLbiTo0j+/RvjQpBrWd6wi3wqkc"
     "5OkMWgAAAACYJzsfBji8eBl5PVjaBV0221pCDlvjSasStCYcZJK9YB8Ze5skOd3JxQ"
     "artvnM1yncOPqd/5kKHxJ0Y7b4U5AFg/vh4BVg6qjaYHnfiJKkvAAAAAA="
 )
+import base64
+COMPANY_ID = base64.b64decode(FULL_LICENSE)[120:136].hex()
 
 # API base URLs
 BASE_ACCOUNT = "https://{}bizaccount.ibroadlink.com"

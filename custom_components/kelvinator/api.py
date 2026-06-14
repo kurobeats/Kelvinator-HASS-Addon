@@ -28,8 +28,8 @@ from .const import (
     BASE_ACCOUNT,
     BASE_ELECTROLUX,
     BASE_FAMILY,
+    COMPANY_ID,
     DEFAULT_LICENSE_ID,
-    FULL_LICENSE,
     KEY_PERMUTATION,
     PASSWORD_SALT,
     TIMESTAMP_SALT,
@@ -74,28 +74,28 @@ def _permute_key(md5_hex: str) -> bytes:
     return bytes(key)
 
 
-def _encrypt_body(plaintext: str, timestamp: str) -> str:
+def _encrypt_body(plaintext: str, timestamp: str) -> bytes:
     """
     AES/CBC/ZeroBytePadding encryption matching BLCommonTools.aesNoPadding().
-    1. key = MD5(timestamp + TIMESTAMP_SALT) → hex → permute
+    1. key = raw MD5(timestamp + TIMESTAMP_SALT) bytes (NO permutation)
     2. AES/CBC with hardcoded IV
-    3. Return hex-encoded ciphertext
+    3. Return raw ciphertext bytes
     """
-    md5_key_hex = _md5(timestamp + TIMESTAMP_SALT)
-    aes_key = _permute_key(md5_key_hex)
+    aes_key = bytes.fromhex(_md5(timestamp + TIMESTAMP_SALT))
     data = plaintext.encode("utf-8")
     cipher = AES.new(aes_key, AES.MODE_CBC, iv=AES_IV)
     padded = pad(data, AES.block_size)
-    return cipher.encrypt(padded).hex()
+    return cipher.encrypt(padded)
 
 
-def _make_token(plaintext: str) -> str:
-    return _md5(plaintext + TOKEN_SALT)
+def _make_token(raw_bytes: bytes) -> str:
+    """MD5(plaintext_bytes + TOKEN_SALT) — matches captured request."""
+    return _md5(raw_bytes + TOKEN_SALT.encode())
 
 
 def _hash_password(raw_password: str) -> str:
-    """SHA1(SHA256(raw) + PASSWORD_SALT)."""
-    return _sha1(_sha256(raw_password) + PASSWORD_SALT)
+    """SHA1(SHA256(password + PASSWORD_SALT)) — verified against captured request."""
+    return _sha1(_sha256(raw_password + PASSWORD_SALT))
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +116,7 @@ class BroadLinkCloudClient:
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: Optional[aiohttp.ClientSession] = None
         self._headers = {
-            "Content-Type": "text/plain;charset=utf-8",
+            "Content-Type": "application/x-java-serialized-object",
             "system": "android",
             "appPlatform": "android",
             "appVersion": "3.8.2",
@@ -157,22 +157,26 @@ class BroadLinkCloudClient:
     # -------------------------------------------------- HTTP
 
     async def _encrypted_post(self, url: str, body: dict, extra_headers: dict | None = None) -> dict:
-        """POST with AES-encrypted body, MD5 token, and additional headers."""
+        """POST with AES-encrypted body and MD5 token header."""
         session = await self._ensure_session()
         timestamp = str(int(time.time()))
         plaintext = json.dumps(body, separators=(",", ":"))
+        plaintext_bytes = plaintext.encode("utf-8")
         ciphertext = _encrypt_body(plaintext, timestamp)
-        token = _make_token(plaintext)
+        token = _make_token(plaintext_bytes)
 
         headers = {
             "timestamp": timestamp,
             "token": token,
             "language": self._language,
-            "locate": self._locate,
-            "licenseid": self._license_id,
         }
+        # Authenticated family API calls need loginsession + lid + userid
+        # (verified against mitmproxy capture)
+        if self._loginsession:
+            headers["loginsession"] = self._loginsession
         if self._userid:
             headers["userid"] = self._userid
+        headers["lid"] = self._license_id
         if extra_headers:
             headers.update(extra_headers)
 
@@ -188,7 +192,7 @@ class BroadLinkCloudClient:
         """Authenticate with BroadLink account. Raises on failure."""
         body = {
             "password": _hash_password(password),
-            "companyid": FULL_LICENSE,
+            "companyid": COMPANY_ID,
         }
         if "@" in username:
             body["email"] = username
@@ -219,16 +223,12 @@ class BroadLinkCloudClient:
     def userid(self) -> Optional[str]:
         return self._userid
 
-    @property
-    def is_logged_in(self) -> bool:
-        return self._loginsession is not None
-
     # -------------------------------------------------- Device list
 
-    async def get_family_base_info_list(self) -> dict:
-        """Get base info for all families/device groups."""
+    async def get_family_id_list(self) -> dict:
+        """Get all family IDs for this account. Matches /ec4/v1/user/getfamilyid."""
         return await self._encrypted_post(
-            self._family_url("/ec4/v1/user/getbasefamilylist"),
+            self._family_url("/ec4/v1/user/getfamilyid"),
             {"userid": self._userid or ""},
         )
 
@@ -243,33 +243,37 @@ class BroadLinkCloudClient:
         """
         Return all cloud-registered devices for the logged-in account.
 
-        Returns a list of dicts with keys: name, mac, host, did, pid.
+        Verified against mitmproxy capture:
+          1. POST /ec4/v1/user/getfamilyid → familyinfo[].id
+          2. POST /ec4/v1/family/getallinfo → familyallinfo[0].devinfo[]
         """
         devices: list[dict] = []
-        info = await self.get_family_base_info_list()
+        info = await self.get_family_id_list()
         if info.get("error") != 0:
-            _LOGGER.warning("get_family_base_info_list failed: %s", info)
+            _LOGGER.warning("get_family_id_list failed: %s", info)
             return []
 
-        families = info.get("familyBaseInfoList", info.get("data", []))
+        families = info.get("familyinfo", [])
         if isinstance(families, list):
             for fam in families:
-                fam_id = fam.get("familyid", fam.get("familyId", ""))
+                fam_id = fam.get("id", "")
                 if not fam_id:
                     continue
                 fam_info = await self.get_family_all_info(fam_id)
                 if fam_info.get("error") != 0:
                     continue
-                dev_list = fam_info.get("deviceinfo", fam_info.get("data", {}))
-                if isinstance(dev_list, list):
-                    for dev in dev_list:
-                        devices.append({
-                            "name": dev.get("name", ""),
-                            "mac": dev.get("mac", ""),
-                            "host": dev.get("host", ""),
-                            "did": dev.get("did", ""),
-                            "pid": dev.get("pid", ""),
-                        })
+                # The response wraps everything in familyallinfo[0]
+                all_info = fam_info.get("familyallinfo", [])
+                if isinstance(all_info, list) and all_info:
+                    dev_list = all_info[0].get("devinfo", [])
+                    if isinstance(dev_list, list):
+                        for dev in dev_list:
+                            devices.append({
+                                "name": dev.get("name", ""),
+                                "mac": dev.get("mac", ""),
+                                "did": dev.get("did", ""),
+                                "pid": dev.get("pid", ""),
+                            })
         return devices
 
 

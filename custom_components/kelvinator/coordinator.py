@@ -14,6 +14,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
+    BroadLinkCloudClient,
     KelvinatorACDevice,
     discover_devices,
     probe_device,
@@ -48,11 +49,23 @@ class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, KelvinatorACDevice]]
         self._country_code = country_code
         self._device_hosts = device_hosts or []
         self._enable_discovery = enable_discovery
+        self._cloud: BroadLinkCloudClient | None = None
         self.devices: dict[str, KelvinatorACDevice] = {}
 
     async def _async_setup(self) -> None:
         """Discover devices. Called once on entry setup."""
-        # 1. Direct probe — user specified IPs
+        # 1. Cloud login — get device list from BroadLink cloud
+        self._cloud = BroadLinkCloudClient(country_code=self._country_code)
+        cloud_devices: list[dict] = []
+        try:
+            await self._cloud.login(self._username, self._password)
+            _LOGGER.info("BroadLink cloud login OK")
+            cloud_devices = await self._cloud.list_devices()
+            _LOGGER.info("Cloud returned %d device(s)", len(cloud_devices))
+        except Exception as exc:
+            _LOGGER.warning("Cloud login failed (LAN-only mode): %s", exc)
+
+        # 2. Direct probe — user specified IPs
         if self._device_hosts:
             _LOGGER.info("Probing %d device(s)...", len(self._device_hosts))
             for host in self._device_hosts:
@@ -71,6 +84,12 @@ class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, KelvinatorACDevice]]
         if not self.devices:
             _LOGGER.warning("No Kelvinator AC devices discovered")
         else:
+            # Enrich LAN devices with cloud names
+            for cd in cloud_devices:
+                mac = cd.get("mac", "")
+                if mac and mac in self.devices:
+                    self.devices[mac]._name = cd.get("name", self.devices[mac]._name)
+
             for dev in self.devices.values():
                 if await dev.connect():
                     await dev.update_state()
@@ -111,4 +130,6 @@ class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, KelvinatorACDevice]]
         return self.devices
 
     async def async_shutdown(self) -> None:
-        """Shutdown coordinator."""
+        """Shutdown coordinator, close cloud session."""
+        if self._cloud:
+            await self._cloud.close()
