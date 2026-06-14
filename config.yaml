@@ -52,6 +52,10 @@ options:
     description: "Enable debug logging"
     required: false
     default: false
+  debug:
+    description: "Enable debug logging"
+    required: false
+    default: false
 schema:
   username: str
   password: str
