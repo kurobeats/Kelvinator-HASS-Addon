@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="64" fill="#003B71"/>
+  <text x="256" y="200" text-anchor="middle" font-family="Arial,sans-serif" font-size="96" font-weight="bold" fill="white">K</text>
+  <text x="256" y="340" text-anchor="middle" font-family="Arial,sans-serif" font-size="56" fill="#00B4D8">HVAC</text>
+  <path d="M256 380 L236 420 L276 420 Z" fill="#00B4D8"/>
+</svg>

@@ -1,0 +1,1 @@
+"""Kelvinator Home Comfort MQTT Bridge for Home Assistant."""
