@@ -24,7 +24,7 @@ Integration for controlling Kelvinator air conditioners in Home Assistant via th
 
 1. In Home Assistant, go to **HACS → Integrations**
 2. Click the **⋮** menu → **Custom repositories**
-3. Paste `https://github.com/ants/Kelvinator-HASS-Addon` as the repository URL, select type **Integration**
+3. Paste `https://github.com/kurobeats/Kelvinator-HASS-Addon` as the repository URL, select type **Integration**
 4. Click **Add**, then find **Kelvinator Home Comfort** and click **Download**
 5. Restart Home Assistant
 
@@ -122,11 +122,11 @@ This project is licensed under the GNU General Public License v3.0 — see [LICE
 
 ---
 
-[release-shield]: https://img.shields.io/github/v/release/ants/Kelvinator-HASS-Addon.svg
-[release]: https://github.com/ants/Kelvinator-HASS-Addon/releases
-[commits-shield]: https://img.shields.io/github/commit-activity/y/ants/Kelvinator-HASS-Addon.svg
-[commits]: https://github.com/ants/Kelvinator-HASS-Addon/commits/main
-[license-shield]: https://img.shields.io/github/license/ants/Kelvinator-HASS-Addon.svg
+[release-shield]: https://img.shields.io/github/v/release/kurobeats/Kelvinator-HASS-Addon.svg
+[release]: https://github.com/kurobeats/Kelvinator-HASS-Addon/releases
+[commits-shield]: https://img.shields.io/github/commit-activity/y/kurobeats/Kelvinator-HASS-Addon.svg
+[commits]: https://github.com/kurobeats/Kelvinator-HASS-Addon/commits/main
+[license-shield]: https://img.shields.io/github/license/kurobeats/Kelvinator-HASS-Addon.svg
 [license]: LICENSE
 [hacsbadge]: https://img.shields.io/badge/HACS-Custom-orange.svg
 [hacs]: https://github.com/hacs/integration
