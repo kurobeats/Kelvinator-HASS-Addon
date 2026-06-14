@@ -14,8 +14,10 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
+    BroadLinkCloudClient,
     KelvinatorACDevice,
     discover_devices,
+    probe_device,
 )
 from .const import DEFAULT_POLL_INTERVAL, DOMAIN
 
@@ -32,6 +34,7 @@ class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, KelvinatorACDevice]]
         password: str,
         country_code: str = "61",
         poll_interval: int = DEFAULT_POLL_INTERVAL,
+        device_host: str = "",
     ) -> None:
         """Initialize the coordinator."""
         super().__init__(
@@ -43,20 +46,49 @@ class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, KelvinatorACDevice]]
         self._username = username
         self._password = password
         self._country_code = country_code
+        self._device_host = device_host
+        self._cloud: BroadLinkCloudClient | None = None
         self.devices: dict[str, KelvinatorACDevice] = {}
 
     async def _async_setup(self) -> None:
-        """Discover devices on LAN. Called once on entry setup."""
-        # The integration works via LAN discovery (BroadLink DNA protocol).
-        # Cloud relay is not yet supported.
-        _LOGGER.info("Discovering BroadLink devices on LAN...")
-        discovered = await discover_devices(timeout=5)
+        """Discover devices. Called once on entry setup."""
+        # 1. Cloud login — get device list from BroadLink cloud
+        self._cloud = BroadLinkCloudClient(country_code=self._country_code)
+        cloud_devices: list[dict] = []
+        try:
+            await self._cloud.login(self._username, self._password)
+            _LOGGER.info("BroadLink cloud login OK")
+            cloud_devices = await self._cloud.list_devices()
+            _LOGGER.info("Cloud returned %d device(s)", len(cloud_devices))
+        except Exception as exc:
+            _LOGGER.warning("Cloud login failed (LAN-only mode): %s", exc)
 
-        if not discovered:
-            _LOGGER.warning("No Kelvinator AC devices discovered on LAN")
+        # 2. Discover devices on LAN
+        if self._device_host:
+            # Direct probe mode — user specified an IP
+            _LOGGER.info("Probing device at %s...", self._device_host)
+            dev = await probe_device(self._device_host, timeout=10)
+            if dev is not None:
+                self.devices[dev.mac] = dev
         else:
+            # UDP broadcast discovery
+            _LOGGER.info("Discovering BroadLink devices on LAN...")
+            discovered = await discover_devices(timeout=5)
             for dev in discovered:
                 self.devices[dev.mac] = dev
+
+        # 3. Merge cloud device info (names, etc.) into LAN-discovered devices
+        for cd in cloud_devices:
+            mac = cd.get("mac", "")
+            if mac and mac in self.devices:
+                # Enrich existing LAN device with cloud name
+                self.devices[mac]._name = cd.get("name", self.devices[mac]._name)
+
+        # 4. Connect and get initial state
+        if not self.devices:
+            _LOGGER.warning("No Kelvinator AC devices discovered")
+        else:
+            for dev in self.devices.values():
                 if await dev.connect():
                     await dev.update_state()
                     _LOGGER.info(
@@ -85,5 +117,6 @@ class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, KelvinatorACDevice]]
         return self.devices
 
     async def async_shutdown(self) -> None:
-        """Shutdown coordinator."""
-        # No persistent connections to close in LAN-only mode.
+        """Shutdown coordinator, close cloud session."""
+        if self._cloud:
+            await self._cloud.close()

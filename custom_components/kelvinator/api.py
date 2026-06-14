@@ -29,6 +29,7 @@ from .const import (
     BASE_ELECTROLUX,
     BASE_FAMILY,
     DEFAULT_LICENSE_ID,
+    FULL_LICENSE,
     KEY_PERMUTATION,
     PASSWORD_SALT,
     TIMESTAMP_SALT,
@@ -108,6 +109,7 @@ class BroadLinkCloudClient:
     def __init__(
         self,
         license_id: str = DEFAULT_LICENSE_ID,
+        country_code: str = "61",
         timeout: int = 15,
     ) -> None:
         self._license_id = license_id
@@ -119,6 +121,11 @@ class BroadLinkCloudClient:
             "appPlatform": "android",
             "appVersion": "3.8.2",
         }
+
+        # Locale — maps country code to BroadLink locate/language format
+        # From BLCommonUtils.getCountry() / getLanguage()
+        self._locate = country_code
+        self._language = "en"
 
         # Auth state
         self._userid: Optional[str] = None
@@ -149,8 +156,8 @@ class BroadLinkCloudClient:
 
     # -------------------------------------------------- HTTP
 
-    async def _encrypted_post(self, url: str, body: dict) -> dict:
-        """POST with AES-encrypted body and MD5 token header."""
+    async def _encrypted_post(self, url: str, body: dict, extra_headers: dict | None = None) -> dict:
+        """POST with AES-encrypted body, MD5 token, and additional headers."""
         session = await self._ensure_session()
         timestamp = str(int(time.time()))
         plaintext = json.dumps(body, separators=(",", ":"))
@@ -160,7 +167,14 @@ class BroadLinkCloudClient:
         headers = {
             "timestamp": timestamp,
             "token": token,
+            "language": self._language,
+            "locate": self._locate,
+            "licenseid": self._license_id,
         }
+        if self._userid:
+            headers["userid"] = self._userid
+        if extra_headers:
+            headers.update(extra_headers)
 
         _LOGGER.debug("POST %s body=%s", url, plaintext)
         async with session.post(url, data=ciphertext, headers=headers) as resp:
@@ -174,7 +188,7 @@ class BroadLinkCloudClient:
         """Authenticate with BroadLink account. Raises on failure."""
         body = {
             "password": _hash_password(password),
-            "companyid": self._license_id,
+            "companyid": FULL_LICENSE,
         }
         if "@" in username:
             body["email"] = username
@@ -190,7 +204,7 @@ class BroadLinkCloudClient:
             raise RuntimeError(f"Login request failed: {exc}") from exc
 
         if result.get("error") != 0:
-            msg = result.get("message", "Unknown error")
+            msg = result.get("msg", result.get("message", "Unknown error"))
             raise RuntimeError(
                 f"Login failed: {msg} (code={result.get('error')})"
             )
@@ -224,6 +238,39 @@ class BroadLinkCloudClient:
             self._family_url("/ec4/v1/family/getallinfo"),
             {"familyid": family_id},
         )
+
+    async def list_devices(self) -> list[dict]:
+        """
+        Return all cloud-registered devices for the logged-in account.
+
+        Returns a list of dicts with keys: name, mac, host, did, pid.
+        """
+        devices: list[dict] = []
+        info = await self.get_family_base_info_list()
+        if info.get("error") != 0:
+            _LOGGER.warning("get_family_base_info_list failed: %s", info)
+            return []
+
+        families = info.get("familyBaseInfoList", info.get("data", []))
+        if isinstance(families, list):
+            for fam in families:
+                fam_id = fam.get("familyid", fam.get("familyId", ""))
+                if not fam_id:
+                    continue
+                fam_info = await self.get_family_all_info(fam_id)
+                if fam_info.get("error") != 0:
+                    continue
+                dev_list = fam_info.get("deviceinfo", fam_info.get("data", {}))
+                if isinstance(dev_list, list):
+                    for dev in dev_list:
+                        devices.append({
+                            "name": dev.get("name", ""),
+                            "mac": dev.get("mac", ""),
+                            "host": dev.get("host", ""),
+                            "did": dev.get("did", ""),
+                            "pid": dev.get("pid", ""),
+                        })
+        return devices
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +575,7 @@ class KelvinatorACDevice:
 
 
 async def discover_devices(timeout: int = 5) -> list[KelvinatorACDevice]:
-    """Discover BroadLink DNA AC devices on the LAN."""
+    """Discover BroadLink DNA AC devices on the LAN via UDP broadcast."""
     try:
         import broadlink
     except ImportError:
@@ -556,3 +603,31 @@ async def discover_devices(timeout: int = 5) -> list[KelvinatorACDevice]:
             _LOGGER.info("Discovered: %s at %s [0x%04X]", mac, host, dev.devtype)
 
     return devices
+
+
+async def probe_device(host: str, timeout: int = 5) -> KelvinatorACDevice | None:
+    """Directly probe a single IP address for a BroadLink AC device."""
+    try:
+        import broadlink
+    except ImportError:
+        _LOGGER.error("broadlink library not installed")
+        return None
+
+    try:
+        dev = await asyncio.to_thread(broadlink.hello, host)
+    except Exception as exc:
+        _LOGGER.error("Probe failed for %s: %s", host, exc)
+        return None
+
+    if dev is None:
+        _LOGGER.warning("No BroadLink device at %s", host)
+        return None
+
+    mac = dev.mac.hex()
+    _LOGGER.info("Probed device at %s: MAC=%s type=0x%04X", host, mac, dev.devtype)
+
+    return KelvinatorACDevice(
+        host=host,
+        mac=mac,
+        name=f"Kelvinator-{mac[-4:]}",
+    )
