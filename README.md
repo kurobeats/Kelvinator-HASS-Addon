@@ -1,0 +1,1 @@
+# Kelvinator-HASS-Addon
