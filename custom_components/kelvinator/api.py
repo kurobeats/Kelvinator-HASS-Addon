@@ -288,6 +288,7 @@ class AcDeviceState:
         "ambient_temp", "error_code",
         "temp_min_c", "temp_max_c",
         "model_number", "serial_number",
+        "timer", "schedule_enabled", "schedule_time",
     )
 
     def __init__(self) -> None:
@@ -307,6 +308,9 @@ class AcDeviceState:
         self.temp_max_c: int = 30
         self.model_number: str = ""
         self.serial_number: str = ""
+        self.timer: str = ""
+        self.schedule_enabled: bool = False
+        self.schedule_time: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +439,14 @@ class KelvinatorACDevice:
         s.display_on = bool(getattr(dev, "display_on", s.display_on))
         s.ambient_temp = float(getattr(dev, "room_temp", s.ambient_temp))
 
+        # Timer / schedule (read-only from LAN)
+        if hasattr(dev, "timer"):
+            s.timer = str(dev.timer or "")
+        if hasattr(dev, "schedule_enabled"):
+            s.schedule_enabled = bool(dev.schedule_enabled)
+        if hasattr(dev, "schedule_time"):
+            s.schedule_time = str(dev.schedule_time or "")
+
     # -------------------------------------------------- Commands
 
     async def _ensure_device(self) -> bool:
@@ -526,6 +538,51 @@ class KelvinatorACDevice:
             return True
         except Exception as exc:
             _LOGGER.error("set_swing_h(%s) failed: %s", on, exc)
+            self.available = False
+            return False
+
+    async def set_display(self, on: bool) -> bool:
+        """Toggle front panel display."""
+        if not await self._ensure_device():
+            return False
+        try:
+            dev = self._device
+            if hasattr(dev, "set_display"):
+                await asyncio.to_thread(dev.set_display, on)
+            self.state.display_on = on
+            return True
+        except Exception as exc:
+            _LOGGER.error("set_display(%s) failed: %s", on, exc)
+            self.available = False
+            return False
+
+    async def set_sleep(self, on: bool) -> bool:
+        """Toggle sleep mode."""
+        if not await self._ensure_device():
+            return False
+        try:
+            dev = self._device
+            if hasattr(dev, "set_sleep"):
+                await asyncio.to_thread(dev.set_sleep, on)
+            self.state.sleep = on
+            return True
+        except Exception as exc:
+            _LOGGER.error("set_sleep(%s) failed: %s", on, exc)
+            self.available = False
+            return False
+
+    async def set_eco(self, on: bool) -> bool:
+        """Toggle ECO mode."""
+        if not await self._ensure_device():
+            return False
+        try:
+            dev = self._device
+            if hasattr(dev, "set_eco"):
+                await asyncio.to_thread(dev.set_eco, on)
+            self.state.eco = on
+            return True
+        except Exception as exc:
+            _LOGGER.error("set_eco(%s) failed: %s", on, exc)
             self.available = False
             return False
 
