@@ -4,10 +4,10 @@
     "codeowners": ["@ants"],
     "config_flow": true,
     "dependencies": [],
-    "documentation": "https://github.com/ants/Kelvinator-HASS-Addon",
+    "documentation": "https://github.com/kurobeats/Kelvinator-HASS-Addon",
     "integration_type": "hub",
     "iot_class": "local_polling",
-    "issue_tracker": "https://github.com/ants/Kelvinator-HASS-Addon/issues",
+    "issue_tracker": "https://github.com/kurobeats/Kelvinator-HASS-Addon/issues",
     "requirements": [
         "broadlink==0.19.0",
         "pycryptodome==3.20.0"

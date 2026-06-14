@@ -14,7 +14,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
-    BroadLinkCloudClient,
     KelvinatorACDevice,
     discover_devices,
 )
@@ -44,20 +43,12 @@ class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, KelvinatorACDevice]]
         self._username = username
         self._password = password
         self._country_code = country_code
-        self._cloud: BroadLinkCloudClient | None = None
         self.devices: dict[str, KelvinatorACDevice] = {}
 
     async def _async_setup(self) -> None:
-        """Login to cloud and discover devices. Called once on entry setup."""
-        # 1. Cloud login (non-fatal — devices may be LAN-only)
-        self._cloud = BroadLinkCloudClient()
-        try:
-            await self._cloud.login(self._username, self._password)
-            _LOGGER.info("BroadLink cloud login OK")
-        except Exception as exc:
-            _LOGGER.warning("Cloud login failed (LAN-only mode): %s", exc)
-
-        # 2. Discover devices on LAN
+        """Discover devices on LAN. Called once on entry setup."""
+        # The integration works via LAN discovery (BroadLink DNA protocol).
+        # Cloud relay is not yet supported.
         _LOGGER.info("Discovering BroadLink devices on LAN...")
         discovered = await discover_devices(timeout=5)
 
@@ -94,6 +85,5 @@ class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, KelvinatorACDevice]]
         return self.devices
 
     async def async_shutdown(self) -> None:
-        """Shutdown coordinator, close cloud session."""
-        if self._cloud:
-            await self._cloud.close()
+        """Shutdown coordinator."""
+        # No persistent connections to close in LAN-only mode.
