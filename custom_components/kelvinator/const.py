@@ -7,7 +7,7 @@ from enum import IntEnum
 # ---------------------------------------------------------------------------
 
 DOMAIN = "kelvinator"
-PLATFORMS = ["climate"]
+PLATFORMS = ["climate", "switch", "sensor"]
 CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
 CONF_COUNTRY_CODE = "country_code"
