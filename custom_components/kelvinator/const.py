@@ -44,6 +44,7 @@ COMPANY_ID = base64.b64decode(FULL_LICENSE)[120:136].hex()
 # API base URLs
 BASE_ACCOUNT = "https://{}bizaccount.ibroadlink.com"
 BASE_FAMILY = "https://{}bizihcv0.ibroadlink.com"
+BASE_FAMILY_PRIVATE = "https://{}bizpd.ibroadlink.com"
 BASE_APP_MANAGE = "https://{}bizappmanage.ibroadlink.com"
 BASE_ELECTROLUX = "https://{}thirdpartyservice.ibroadlink.com"
 

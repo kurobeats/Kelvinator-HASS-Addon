@@ -28,6 +28,7 @@ from .const import (
     BASE_ACCOUNT,
     BASE_ELECTROLUX,
     BASE_FAMILY,
+    BASE_FAMILY_PRIVATE,
     COMPANY_ID,
     DEFAULT_LICENSE_ID,
     KEY_PERMUTATION,
@@ -160,6 +161,9 @@ class BroadLinkCloudClient:
 
     def _electrolux_url(self, path: str) -> str:
         return BASE_ELECTROLUX.format(self._license_id) + path
+
+    def _private_url(self, path: str) -> str:
+        return BASE_FAMILY_PRIVATE.format(self._license_id) + path
 
     # -------------------------------------------------- Family API key management
 
@@ -390,6 +394,81 @@ class BroadLinkCloudClient:
                             "pid": dev.get("pid", ""),
                         })
         return devices
+
+    # -------------------------------------------------- Private data (cloud relay state)
+
+    async def get_family_private_data_id(self) -> dict:
+        """
+        Get private data storage ID for this family.
+        POST /ec4/v1/family/privatedata/getid
+        """
+        return await self._family_encrypted_post(
+            self._private_url("/ec4/v1/family/privatedata/getid"),
+            {"mtag": "subdevinfo"},
+        )
+
+    async def query_private_data(self, family_id: str, mkeyid: str) -> dict:
+        """
+        Query private data by mkeyid.
+        POST /ec4/v1/family/privatedata/query
+        """
+        return await self._family_encrypted_post(
+            self._private_url("/ec4/v1/family/privatedata/query"),
+            {"familyid": family_id, "mtag": "subdevinfo", "mkeyid": mkeyid},
+        )
+
+    async def query_all_private_data(self, family_id: str) -> dict:
+        """
+        Query all private data for a family.
+        POST /ec4/v1/family/privatedata/queryall
+        """
+        return await self._family_encrypted_post(
+            self._private_url("/ec4/v1/family/privatedata/queryall"),
+            {"familyid": family_id},
+        )
+
+    async def update_private_data(
+        self, family_id: str, updates: list[dict]
+    ) -> dict:
+        """
+        Update private data entries.
+        POST /ec4/v1/family/privatedata/update
+        Each update: {"mtag": "subdevinfo", "mkeyid": str, "content": str, "idversion": str}
+        """
+        return await self._family_encrypted_post(
+            self._private_url("/ec4/v1/family/privatedata/update"),
+            {
+                "familyid": family_id,
+                "version": "",
+                "updatefamily": 0,
+                "datalist": updates,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cloud-only device model (no LAN required)
+# ---------------------------------------------------------------------------
+
+
+class CloudACDevice:
+    """Represents a Kelvinator AC unit via cloud API only."""
+
+    def __init__(
+        self,
+        cloud: BroadLinkCloudClient,
+        did: str,
+        mac: str,
+        name: str = "Kelvinator AC",
+        pid: str = "",
+    ) -> None:
+        self._cloud = cloud
+        self.did = did
+        self.mac = mac
+        self.name = name
+        self.pid = pid
+        self.state = AcDeviceState()
+        self.available = True
 
 
 # ---------------------------------------------------------------------------

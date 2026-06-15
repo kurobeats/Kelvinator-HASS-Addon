@@ -19,7 +19,7 @@ from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .api import KelvinatorACDevice
+from .api import CloudACDevice
 from .const import (
     DOMAIN,
     FAN_KELVINATOR_TO_HA,
@@ -84,7 +84,7 @@ class KelvinatorClimate(ClimateEntity):
         self,
         coordinator: KelvinatorCoordinator,
         mac: str,
-        device: KelvinatorACDevice,
+        device: CloudACDevice,
     ) -> None:
         """Initialize the climate entity."""
         self._coordinator = coordinator
