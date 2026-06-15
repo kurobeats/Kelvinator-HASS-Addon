@@ -137,7 +137,7 @@ class BroadLinkCloudClient:
         self._family_server_key: Optional[str] = None
         self._family_server_timestamp: Optional[str] = None
         self._family_key_fetched_time: float = 0.0
-        _FAMILY_KEY_TTL = 7200  # 2 hours, matching decompiled APK
+        self._FAMILY_KEY_TTL: int = 7200  # 2 hours, matching decompiled APK
 
     # -------------------------------------------------- Session management
 
