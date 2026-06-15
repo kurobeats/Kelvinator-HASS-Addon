@@ -14,7 +14,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .api import KelvinatorACDevice
+from .api import CloudACDevice
 from .const import DOMAIN
 from .coordinator import KelvinatorCoordinator
 
@@ -95,7 +95,7 @@ class KelvinatorSwitch(SwitchEntity):
         self,
         coordinator: KelvinatorCoordinator,
         mac: str,
-        device: KelvinatorACDevice,
+        device: CloudACDevice,
         description: SwitchEntityDescription,
     ) -> None:
         """Initialize the switch."""

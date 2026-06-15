@@ -1,31 +1,26 @@
 """
 DataUpdateCoordinator for the Kelvinator Home Comfort integration.
 
-Polls all discovered Kelvinator AC devices at a configurable interval.
+Cloud-only — all communication goes via BroadLink cloud API.
+No LAN discovery or direct device communication required.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import timedelta
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import (
-    BroadLinkCloudClient,
-    KelvinatorACDevice,
-    discover_devices,
-    probe_device,
-)
+from .api import BroadLinkCloudClient, CloudACDevice
 from .const import DEFAULT_POLL_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, KelvinatorACDevice]]):
-    """Coordinates polling of all Kelvinator AC devices."""
+class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, CloudACDevice]]):
+    """Coordinates polling of all Kelvinator AC devices via cloud API."""
 
     def __init__(
         self,
@@ -47,85 +42,72 @@ class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, KelvinatorACDevice]]
         self._username = username
         self._password = password
         self._country_code = country_code
-        self._device_hosts = device_hosts or []
-        self._enable_discovery = enable_discovery
         self._cloud: BroadLinkCloudClient | None = None
-        self.devices: dict[str, KelvinatorACDevice] = {}
+        self.devices: dict[str, CloudACDevice] = {}
 
     async def _async_setup(self) -> None:
-        """Discover devices. Called once on entry setup."""
-        # 1. Cloud login — get device list from BroadLink cloud
+        """Discover devices from cloud. Called once on entry setup."""
         self._cloud = BroadLinkCloudClient(country_code=self._country_code)
-        cloud_devices: list[dict] = []
+
         try:
             await self._cloud.login(self._username, self._password)
             _LOGGER.info("BroadLink cloud login OK")
-            cloud_devices = await self._cloud.list_devices()
-            _LOGGER.info("Cloud returned %d device(s)", len(cloud_devices))
         except Exception as exc:
-            _LOGGER.warning("Cloud login failed (LAN-only mode): %s", exc)
+            _LOGGER.error("Cloud login failed: %s", exc)
+            raise UpdateFailed(f"Cloud login failed: {exc}") from exc
 
-        # 2. Direct probe — user specified IPs
-        if self._device_hosts:
-            _LOGGER.info("Probing %d device(s)...", len(self._device_hosts))
-            for host in self._device_hosts:
-                dev = await probe_device(host, timeout=10)
-                if dev is not None:
-                    self.devices[dev.mac] = dev
+        # Discover devices from cloud (not LAN)
+        cloud_devices = await self._cloud.list_devices()
+        _LOGGER.info("Cloud returned %d device(s)", len(cloud_devices))
 
-        # 2. UDP broadcast discovery (if enabled)
-        if not self._device_hosts or self._enable_discovery:
-            _LOGGER.info("Discovering BroadLink devices on LAN...")
-            discovered = await discover_devices(timeout=5)
-            for dev in discovered:
-                if dev.mac not in self.devices:
-                    self.devices[dev.mac] = dev
+        for cd in cloud_devices:
+            did = cd.get("did", "")
+            if not did:
+                continue
+            self.devices[did] = CloudACDevice(
+                cloud=self._cloud,
+                did=did,
+                mac=cd.get("mac", ""),
+                name=cd.get("name", "Kelvinator AC"),
+                pid=cd.get("pid", ""),
+            )
 
         if not self.devices:
-            _LOGGER.warning("No Kelvinator AC devices discovered")
-        else:
-            # Enrich LAN devices with cloud names
-            for cd in cloud_devices:
-                mac = cd.get("mac", "")
-                if mac and mac in self.devices:
-                    self.devices[mac]._name = cd.get("name", self.devices[mac]._name)
+            _LOGGER.error("No Kelvinator AC devices found in cloud account")
+            raise UpdateFailed("No devices found in cloud account")
 
-            for dev in self.devices.values():
-                if await dev.connect():
-                    await dev.update_state()
-                    _LOGGER.info(
-                        "Device %s [%s]: power=%s temp=%d°C",
-                        dev.name, dev.mac,
-                        dev.state.power, dev.state.target_temp,
-                    )
+        _LOGGER.info(
+            "Registered %d cloud devices: %s",
+            len(self.devices),
+            ", ".join(d.name for d in self.devices.values()),
+        )
 
-    async def _async_update_data(self) -> dict[str, KelvinatorACDevice]:
-        """Poll all devices. Called automatically at each interval."""
-        # 1. Poll existing devices
-        for dev in list(self.devices.values()):
-            ok = await dev.update_state()
-            if not ok:
-                _LOGGER.warning("Device %s unreachable", dev.name)
+    async def _async_update_data(self) -> dict[str, CloudACDevice]:
+        """Poll device state via cloud API (no LAN required)."""
+        # Re-list devices from cloud in case new ones appeared
+        try:
+            cloud_devices = await self._cloud.list_devices()
+        except Exception as exc:
+            _LOGGER.error("Failed to list cloud devices: %s", exc)
+            raise UpdateFailed(f"Cloud device list failed: {exc}") from exc
 
-        # 2. Probe any user-specified IPs not yet discovered
-        for host in self._device_hosts:
-            if not any(d.host == host for d in self.devices.values()):
-                dev = await probe_device(host, timeout=5)
-                if dev is not None and dev.mac not in self.devices:
-                    self.devices[dev.mac] = dev
-                    if await dev.connect():
-                        await dev.update_state()
-                        _LOGGER.info("New device from configured IP: %s", dev.name)
+        # Merge cloud devices into our registry
+        for cd in cloud_devices:
+            did = cd.get("did", "")
+            if not did:
+                continue
+            if did not in self.devices:
+                self.devices[did] = CloudACDevice(
+                    cloud=self._cloud,
+                    did=did,
+                    mac=cd.get("mac", ""),
+                    name=cd.get("name", "Kelvinator AC"),
+                    pid=cd.get("pid", ""),
+                )
+                _LOGGER.info("New cloud device: %s", cd.get("name"))
 
-        # 3. Also try re-discovering via UDP if no devices found
-        if not self.devices and self._enable_discovery:
-            discovered = await discover_devices(timeout=3)
-            for dev in discovered:
-                if dev.mac not in self.devices:
-                    self.devices[dev.mac] = dev
-                    if await dev.connect():
-                        await dev.update_state()
-                        _LOGGER.info("New device: %s", dev.name)
+        # TODO: Poll actual state from cloud private data API
+        # For now, devices report as available with default state
 
         return self.devices
 
