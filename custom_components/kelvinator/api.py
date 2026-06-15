@@ -127,10 +127,17 @@ class BroadLinkCloudClient:
         self._locate = country_code
         self._language = "en"
 
-        # Auth state
+        # -------------------------------------------------- Auth state
+
         self._userid: Optional[str] = None
         self._loginsession: Optional[str] = None
         self._nickname: Optional[str] = None
+
+        # Family API state (uses separate encryption scheme)
+        self._family_server_key: Optional[str] = None
+        self._family_server_timestamp: Optional[str] = None
+        self._family_key_fetched_time: float = 0.0
+        _FAMILY_KEY_TTL = 7200  # 2 hours, matching decompiled APK
 
     # -------------------------------------------------- Session management
 
@@ -153,6 +160,74 @@ class BroadLinkCloudClient:
 
     def _electrolux_url(self, path: str) -> str:
         return BASE_ELECTROLUX.format(self._license_id) + path
+
+    # -------------------------------------------------- Family API key management
+
+    async def _ensure_family_key(self) -> bool:
+        """
+        Fetch encryption key from /ec4/v1/common/api.
+        Key is cached for 2 hours (7200s) — matches decompiled APK.
+        """
+        now = time.time()
+        if (
+            self._family_server_key is not None
+            and (now - self._family_key_fetched_time) < self._FAMILY_KEY_TTL
+        ):
+            return True
+
+        url = self._family_url("/ec4/v1/common/api")
+        session = await self._ensure_session()
+        timestamp = str(int(time.time()))
+        headers = {
+            "system": "android",
+            "appPlatform": "android",
+            "language": self._language,
+            "timestamp": timestamp,
+        }
+        try:
+            _LOGGER.debug("GET %s", url)
+            async with session.get(url, headers=headers) as resp:
+                text = await resp.text()
+                _LOGGER.debug("Key response [%d]: %s", resp.status, text[:300])
+                data = json.loads(text)
+                if data.get("error") == 0:
+                    self._family_server_timestamp = str(data.get("timestamp", ""))
+                    self._family_server_key = data.get("key")
+                    self._family_key_fetched_time = now
+                    return True
+                _LOGGER.warning("Failed to fetch family API key: %s", data)
+                return False
+        except (aiohttp.ClientError, json.JSONDecodeError, KeyError) as exc:
+            _LOGGER.error("Failed to fetch family API key: %s", exc)
+            return False
+
+    def _make_family_token(self, plaintext: str) -> str:
+        """
+        Token for Family API: MD5(body + TOKEN_SALT + server_timestamp + userid)
+        Matches token calculation in decompiled j.java:
+          MD5(str2 = str + 'xgx3d*fe3478$ukx' + String.valueOf(this.g) + this.a)
+        """
+        raw = (
+            plaintext
+            + TOKEN_SALT
+            + (self._family_server_timestamp or "")
+            + (self._userid or "")
+        )
+        return _md5(raw)
+
+    def _encrypt_family_body(self, plaintext: str) -> bytes:
+        """
+        Family API uses server-provided hex key (NOT MD5-derived).
+        AES/CBC/ZeroBytePadding with hardcoded IV.
+        """
+        aes_key = bytes.fromhex(self._family_server_key or "")
+        data = plaintext.encode("utf-8")
+        cipher = AES.new(aes_key, AES.MODE_CBC, iv=AES_IV)
+        # ZeroBytePadding: pad with null bytes (0x00)
+        block_size = AES.block_size
+        padded_len = block_size * ((len(data) + block_size - 1) // block_size)
+        padded = data.ljust(padded_len, b"\x00")
+        return cipher.encrypt(padded)
 
     # -------------------------------------------------- HTTP
 
@@ -184,6 +259,38 @@ class BroadLinkCloudClient:
         async with session.post(url, data=ciphertext, headers=headers) as resp:
             text = await resp.text()
             _LOGGER.debug("Response [%d]: %s", resp.status, text[:500])
+            return json.loads(text)
+
+    async def _family_encrypted_post(self, url: str, body: dict) -> dict:
+        """
+        Family-API encrypted POST.
+        Uses server-provided AES key instead of client-derived key.
+        Token includes salt + server_timestamp + userid.
+        """
+        session = await self._ensure_session()
+        if not await self._ensure_family_key():
+            return {"error": -1, "msg": "Failed to obtain family API encryption key"}
+
+        plaintext = json.dumps(body, separators=(",", ":"))
+        ciphertext = self._encrypt_family_body(plaintext)
+        token = self._make_family_token(plaintext)
+        timestamp = self._family_server_timestamp or str(int(time.time()))
+
+        headers = {
+            "timestamp": timestamp,
+            "token": token,
+            "language": self._language,
+            "userid": self._userid or "",
+            "loginsession": self._loginsession or "",
+            "lid": self._license_id,
+        }
+
+        _LOGGER.debug("Family POST %s body=%s", url, plaintext)
+        async with session.post(url, data=ciphertext, headers=headers) as resp:
+            text = await resp.text()
+            _LOGGER.debug("Family Response [%d]: %s", resp.status, text[:500])
+            if not text:
+                return {"error": -1, "msg": "Empty response"}
             return json.loads(text)
 
     # -------------------------------------------------- Auth
@@ -227,25 +334,29 @@ class BroadLinkCloudClient:
 
     async def get_family_id_list(self) -> dict:
         """Get all family IDs for this account. Matches /ec4/v1/user/getfamilyid."""
-        return await self._encrypted_post(
+        return await self._family_encrypted_post(
             self._family_url("/ec4/v1/user/getfamilyid"),
             {"userid": self._userid or ""},
         )
 
-    async def get_family_all_info(self, family_id: str) -> dict:
-        """Get full family info including device list."""
-        return await self._encrypted_post(
+    async def get_family_all_info(self, family_ids: list[str]) -> dict:
+        """Get full family info including device list. Matches /ec4/v1/family/getallinfo."""
+        return await self._family_encrypted_post(
             self._family_url("/ec4/v1/family/getallinfo"),
-            {"familyid": family_id},
+            {
+                "userid": self._userid or "",
+                "familyid": family_ids,
+            },
         )
 
     async def list_devices(self) -> list[dict]:
         """
         Return all cloud-registered devices for the logged-in account.
 
-        Verified against mitmproxy capture:
+        Matches decompiled APK flow:
           1. POST /ec4/v1/user/getfamilyid → familyinfo[].id
-          2. POST /ec4/v1/family/getallinfo → familyallinfo[0].devinfo[]
+          2. POST /ec4/v1/family/getallinfo (with array of family IDs)
+             → familyallinfo[].devinfo[]
         """
         devices: list[dict] = []
         info = await self.get_family_id_list()
@@ -254,26 +365,30 @@ class BroadLinkCloudClient:
             return []
 
         families = info.get("familyinfo", [])
-        if isinstance(families, list):
-            for fam in families:
-                fam_id = fam.get("id", "")
-                if not fam_id:
-                    continue
-                fam_info = await self.get_family_all_info(fam_id)
-                if fam_info.get("error") != 0:
-                    continue
-                # The response wraps everything in familyallinfo[0]
-                all_info = fam_info.get("familyallinfo", [])
-                if isinstance(all_info, list) and all_info:
-                    dev_list = all_info[0].get("devinfo", [])
-                    if isinstance(dev_list, list):
-                        for dev in dev_list:
-                            devices.append({
-                                "name": dev.get("name", ""),
-                                "mac": dev.get("mac", ""),
-                                "did": dev.get("did", ""),
-                                "pid": dev.get("pid", ""),
-                            })
+        if not isinstance(families, list) or not families:
+            return []
+
+        family_ids = [fam.get("id", "") for fam in families if fam.get("id")]
+        if not family_ids:
+            return []
+
+        fam_info = await self.get_family_all_info(family_ids)
+        if fam_info.get("error") != 0:
+            _LOGGER.warning("get_family_all_info failed: %s", fam_info)
+            return []
+
+        all_info = fam_info.get("familyallinfo", [])
+        if isinstance(all_info, list):
+            for entry in all_info:
+                dev_list = entry.get("devinfo", [])
+                if isinstance(dev_list, list):
+                    for dev in dev_list:
+                        devices.append({
+                            "name": dev.get("name", ""),
+                            "mac": dev.get("mac", ""),
+                            "did": dev.get("did", ""),
+                            "pid": dev.get("pid", ""),
+                        })
         return devices
 
 
