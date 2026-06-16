@@ -1,7 +1,5 @@
 """
 Climate platform for Kelvinator Home Comfort integration.
-
-Exposes each Kelvinator AC unit as a Home Assistant ClimateEntity.
 """
 
 from __future__ import annotations
@@ -22,9 +20,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .api import CloudACDevice
 from .const import (
     DOMAIN,
+    FAN_HA_TO_KELVINATOR,
     FAN_KELVINATOR_TO_HA,
     FAN_MODES,
     HVAC_MODES,
+    MODE_HA_TO_KELVINATOR,
     MODE_KELVINATOR_TO_HA,
     SWING_MODES,
 )
@@ -38,30 +38,26 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Kelvinator climate entities from a config entry."""
     coordinator: KelvinatorCoordinator = hass.data[DOMAIN][entry.entry_id]
-
-    # Create one entity per discovered device
-    entities: list[KelvinatorClimate] = []
-    for mac, device in coordinator.devices.items():
-        entities.append(KelvinatorClimate(coordinator, mac, device))
-
+    entities: list[KelvinatorClimate] = [
+        KelvinatorClimate(coordinator, did, dev)
+        for did, dev in coordinator.devices.items()
+    ]
     async_add_entities(entities)
 
-    # Register a listener to add newly discovered devices dynamically
     @callback
-    def _async_add_new_devices() -> None:
-        current_macs = {e.mac for e in entities}
-        new_entities: list[KelvinatorClimate] = []
-        for mac, device in coordinator.devices.items():
-            if mac not in current_macs:
-                entity = KelvinatorClimate(coordinator, mac, device)
-                entities.append(entity)
-                new_entities.append(entity)
-        if new_entities:
-            async_add_entities(new_entities)
+    def _add_new() -> None:
+        current = {e._did for e in entities}
+        new = [
+            KelvinatorClimate(coordinator, did, dev)
+            for did, dev in coordinator.devices.items()
+            if did not in current
+        ]
+        if new:
+            entities.extend(new)
+            async_add_entities(new)
 
-    coordinator.async_add_listener(_async_add_new_devices)
+    coordinator.async_add_listener(_add_new)
 
 
 class KelvinatorClimate(ClimateEntity):
@@ -81,18 +77,13 @@ class KelvinatorClimate(ClimateEntity):
     )
 
     def __init__(
-        self,
-        coordinator: KelvinatorCoordinator,
-        mac: str,
-        device: CloudACDevice,
+        self, coordinator: KelvinatorCoordinator, did: str, device: CloudACDevice,
     ) -> None:
-        """Initialize the climate entity."""
         self._coordinator = coordinator
-        self._mac = mac
+        self._did = did
         self._device = device
-
-        self._attr_unique_id = f"kelvinator_ac_{mac.replace(':', '_').lower()}"
-        self._attr_name = device.name
+        mac_s = device.mac.replace(":", "_").lower()
+        self._attr_unique_id = f"kelvinator_ac_{mac_s}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, device.mac)},
             "name": device.name,
@@ -102,16 +93,13 @@ class KelvinatorClimate(ClimateEntity):
         }
 
     @property
-    def mac(self) -> str:
-        return self._mac
-
-    @property
     def available(self) -> bool:
         return self._device.available
 
     @property
     def current_temperature(self) -> float | None:
-        return self._device.state.ambient_temp
+        t = self._device.state.ambient_temp
+        return float(t) if t > 0 else None
 
     @property
     def target_temperature(self) -> float | None:
@@ -129,63 +117,68 @@ class KelvinatorClimate(ClimateEntity):
     def hvac_mode(self) -> HVACMode | None:
         if not self._device.state.power:
             return HVACMode.OFF
-        return HVACMode(MODE_KELVINATOR_TO_HA.get(
-            self._device.state.mode, "auto"
-        ))
+        return HVACMode(MODE_KELVINATOR_TO_HA.get(self._device.state.mode, "auto"))
 
     @property
     def fan_mode(self) -> str | None:
-        return FAN_KELVINATOR_TO_HA.get(
-            self._device.state.fan_speed, "auto"
-        )
+        return FAN_KELVINATOR_TO_HA.get(self._device.state.fan, "auto")
 
     @property
     def swing_mode(self) -> str | None:
-        s = self._device.state
-        if s.swing_vertical and s.swing_horizontal:
+        s = self._device.state.swing
+        if s == 3:
             return "both"
-        elif s.swing_vertical:
+        elif s == 1:
             return "vertical"
-        elif s.swing_horizontal:
+        elif s == 2:
             return "horizontal"
         return "off"
 
-    # -------------------------------------------------- Commands
-
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        temp = kwargs.get(ATTR_TEMPERATURE)
-        if temp is not None:
-            await self._device.set_temperature(int(temp))
-            await self._coordinator.async_request_refresh()
+        t = kwargs.get(ATTR_TEMPERATURE)
+        if t is not None:
+            await self._device.send_command({"temp": int(t)})
+            self._device.state.target_temp = int(t)
+            self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        await self._device.set_hvac_mode(hvac_mode.value)
-        await self._coordinator.async_request_refresh()
+        if hvac_mode == HVACMode.OFF:
+            await self._device.send_command({"power": 0})
+            self._device.state.power = False
+        else:
+            mode = MODE_HA_TO_KELVINATOR.get(hvac_mode.value, 4)
+            await self._device.send_command({"power": 1, "mode": mode})
+            self._device.state.power = True
+            self._device.state.mode = int(mode)
+        self.async_write_ha_state()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
-        await self._device.set_fan_mode(fan_mode)
-        await self._coordinator.async_request_refresh()
+        fan = FAN_HA_TO_KELVINATOR.get(fan_mode, 0)
+        await self._device.send_command({"fan": int(fan)})
+        self._device.state.fan = int(fan)
+        self.async_write_ha_state()
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
-        await self._device.set_swing_mode(swing_mode)
-        await self._coordinator.async_request_refresh()
+        v = 1 if swing_mode in ("vertical", "both") else 0
+        h = 1 if swing_mode in ("horizontal", "both") else 0
+        await self._device.send_command({"vdir": v, "hdir": h})
+        self._device.state.swing = (1 if v else 0) | (2 if h else 0)
+        self.async_write_ha_state()
 
     async def async_turn_on(self) -> None:
-        await self._device.set_power(True)
-        await self._coordinator.async_request_refresh()
+        await self._device.send_command({"power": 1})
+        self._device.state.power = True
+        self.async_write_ha_state()
 
     async def async_turn_off(self) -> None:
-        await self._device.set_power(False)
-        await self._coordinator.async_request_refresh()
-
-    # -------------------------------------------------- Coordinator
+        await self._device.send_command({"power": 0})
+        self._device.state.power = False
+        self.async_write_ha_state()
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Handle updated data from coordinator."""
-        # Device may have been replaced in coordinator.devices dict
-        if self._mac in self._coordinator.devices:
-            self._device = self._coordinator.devices[self._mac]
+        if self._did in self._coordinator.devices:
+            self._device = self._coordinator.devices[self._did]
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:

@@ -1,111 +1,177 @@
 """
 Kelvinator Home Comfort — API layer.
 
-Contains:
-  - Cryptographic helpers (matching the BroadLink app's BLCommonTools)
-  - BroadLink Cloud API client (async, aiohttp-based)
-  - Device client wrapping python-broadlink for LAN/cloud relay control
-
-All logic is extracted from the original add-on; no guessing.
+Uses the kelvinator-dna library for:
+  - Cloud device discovery (HTTPS REST API via kelvinator_dna.cloud)
+  - DNA protocol control (UDP or cloud relay via libNetworkAPI.so)
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
+import json as _json
 import logging
+import os
 import time
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import aiohttp
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
-
-from .const import (
-    AC_DEVICE_TYPES,
-    AES_IV,
-    BASE_ACCOUNT,
-    BASE_ELECTROLUX,
-    BASE_FAMILY,
-    BASE_FAMILY_PRIVATE,
-    COMPANY_ID,
-    DEFAULT_LICENSE_ID,
-    KEY_PERMUTATION,
-    PASSWORD_SALT,
-    TIMESTAMP_SALT,
-    TOKEN_SALT,
-    AcMode,
-    FanSpeed,
-    FAN_HA_TO_KELVINATOR,
-    MODE_HA_TO_KELVINATOR,
-)
+from .const import DEFAULT_LICENSE_ID
 
 _LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Cryptographic helpers — matching BLCommonTools from decompiled APK
+# Try to locate libNetworkAPI.so for cloud relay
+# ---------------------------------------------------------------------------
+
+_SO_DIR = os.path.dirname(os.path.abspath(__file__))
+_SO_PATH = os.environ.get(
+    "KELVINATOR_SO_PATH",
+    os.path.join(_SO_DIR, "libNetworkAPI.so"),
+)
+_SO_AVAILABLE = os.path.exists(_SO_PATH)
+
+# ---------------------------------------------------------------------------
+# Data models
 # ---------------------------------------------------------------------------
 
 
-def _md5(data: bytes | str) -> str:
-    if isinstance(data, str):
-        data = data.encode()
-    return hashlib.md5(data).hexdigest().lower()
+@dataclass
+class CloudDeviceInfo:
+    """Device credentials retrieved from the BroadLink cloud."""
+    did: str
+    mac: str
+    name: str = "Kelvinator AC"
+    pid: str = ""
+    password: int = 0
+    aes_key: str = ""
+    devtype: int = 20379
+    terminal_id: int = 1
+    sub_device_num: int = 0
 
 
-def _sha1(data: str) -> str:
-    return hashlib.sha1(data.encode()).hexdigest().lower()
-
-
-def _sha256(data: str) -> str:
-    return hashlib.sha256(data.encode()).hexdigest().lower()
-
-
-def _parse_hex_to_bytes(hex_str: str) -> bytes:
-    return bytes.fromhex(hex_str)
-
-
-def _permute_key(md5_hex: str) -> bytes:
-    """Apply key permutation from aeskeyDecrypt()."""
-    md5_bytes = _parse_hex_to_bytes(md5_hex)
-    key = bytearray(16)
-    for i, idx in enumerate(KEY_PERMUTATION):
-        key[i] = md5_bytes[idx]
-    return bytes(key)
-
-
-def _encrypt_body(plaintext: str, timestamp: str) -> bytes:
-    """
-    AES/CBC/ZeroBytePadding encryption matching BLCommonTools.aesNoPadding().
-    1. key = raw MD5(timestamp + TIMESTAMP_SALT) bytes (NO permutation)
-    2. AES/CBC with hardcoded IV
-    3. Return raw ciphertext bytes
-    """
-    aes_key = bytes.fromhex(_md5(timestamp + TIMESTAMP_SALT))
-    data = plaintext.encode("utf-8")
-    cipher = AES.new(aes_key, AES.MODE_CBC, iv=AES_IV)
-    padded = pad(data, AES.block_size)
-    return cipher.encrypt(padded)
-
-
-def _make_token(raw_bytes: bytes) -> str:
-    """MD5(plaintext_bytes + TOKEN_SALT) — matches captured request."""
-    return _md5(raw_bytes + TOKEN_SALT.encode())
-
-
-def _hash_password(raw_password: str) -> str:
-    """SHA1(SHA256(password + PASSWORD_SALT)) — verified against captured request."""
-    return _sha1(_sha256(raw_password + PASSWORD_SALT))
+@dataclass
+class AcDeviceState:
+    """Full state of a Kelvinator AC unit, normalized for HA."""
+    power: bool = False
+    mode: int = 0       # 0=cool, 1=heat, 2=auto, 3=fan, 4=dry
+    target_temp: int = 24
+    fan: int = 0        # 0=auto, 1=low, 2=med, 3=high
+    swing: int = 0      # 0=off, 1=vert, 2=horiz, 3=both
+    sleep: bool = False
+    eco: bool = False
+    display_on: bool = True
+    temp_unit_celsius: bool = True
+    ambient_temp: float = 0.0
+    error_code: int = 0
+    temp_min_c: int = 16
+    temp_max_c: int = 30
+    model_number: str = ""
+    serial_number: str = ""
 
 
 # ---------------------------------------------------------------------------
-# BroadLink Cloud API Client (async, aiohttp)
+# Synchronous cloud helpers (run in executor threads)
 # ---------------------------------------------------------------------------
 
 
-class BroadLinkCloudClient:
-    """Authenticated async client for the BroadLink cloud API."""
+def _get_company_id() -> str:
+    import base64
+    FULL_LICENSE = (
+        "vdtK9T907aoDsapDm3Xnpviv67CfTNVaCnBaVHLbiTo0j+/RvjQpBrWd6wi3wqkc"
+        "5OkMWgAAAACYJzsfBji8eBl5PVjaBV0221pCDlvjSasStCYcZJK9YB8Ze5skOd3JxQ"
+        "artvnM1yncOPqd/5kKHxJ0Y7b4U5AFg/vh4BVg6qjaYHnfiJKkvAAAAAA="
+    )
+    return base64.b64decode(FULL_LICENSE)[120:136].hex()
+
+
+def _cloud_login_sync(
+    license_id: str, username: str, password: str,
+) -> tuple[str, str]:
+    """Blocking cloud login using kelvinator_dna.cloud."""
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
+
+    IV = bytes([0xEA, 0xAA, 0xAA, 0x3A, 0xBB, 0x58, 0x62, 0xA2,
+                0x19, 0x18, 0xB5, 0x77, 0x1D, 0x16, 0x15, 0xAA])
+
+    ts = str(int(time.time()))
+    pw_sha256 = hashlib.sha256((password + "4969fj#k23#").encode()).hexdigest().lower()
+    pw_hash = hashlib.sha1(pw_sha256.encode()).hexdigest().lower()
+
+    body = _json.dumps({
+        "phone" if username.isdigit() else "email": username,
+        "password": pw_hash,
+        "companyid": _get_company_id(),
+    }, separators=(",", ":"))
+
+    aes_key = bytes.fromhex(hashlib.md5(
+        (ts + "kdixkdqp54545^#*").encode()
+    ).hexdigest().lower())
+    cipher = AES.new(aes_key, AES.MODE_CBC, iv=IV)
+    encrypted = cipher.encrypt(pad(body.encode(), AES.block_size))
+    token = hashlib.md5(body.encode() + b"xgx3d*fe3478$ukx").hexdigest().lower()
+
+    import urllib.request
+    import ssl
+    ctx = ssl.create_default_context()
+
+    url = f"https://{license_id}bizaccount.ibroadlink.com/account/login"
+    req = urllib.request.Request(
+        url, data=encrypted,
+        headers={
+            "Content-Type": "application/x-java-serialized-object",
+            "system": "android", "appPlatform": "android",
+            "language": "en-au", "timestamp": ts, "token": token,
+        },
+    )
+    with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+        data = _json.loads(resp.read().decode())
+
+    if data.get("error") != 0:
+        raise RuntimeError(f"Login failed: {data.get('msg', 'Unknown error')}")
+    return data["userid"], data["loginsession"]
+
+
+def _cloud_discover_sync(
+    license_id: str, user_id: str, login_session: str, language: str,
+) -> list[CloudDeviceInfo]:
+    """Blocking cloud device discovery using kelvinator_dna.cloud."""
+    from kelvinator_dna.cloud import KelvinatorCloud
+
+    cloud = KelvinatorCloud(
+        license_id=license_id,
+        user_id=user_id,
+        login_session=login_session,
+        language=language,
+    )
+    cloud.authenticate()
+    raw_devices = cloud.discover_devices()
+
+    devices = []
+    for d in raw_devices:
+        devices.append(CloudDeviceInfo(
+            did=d.did,
+            mac=d.mac,
+            name=d.name,
+            pid=d.pid,
+            password=d.password,
+            aes_key=d.aes_key,
+            devtype=getattr(d, "devtype", 20379),
+            terminal_id=getattr(d, "terminal_id", 1),
+            sub_device_num=getattr(d, "sub_device_num", 0),
+        ))
+    return devices
+
+
+# ---------------------------------------------------------------------------
+# Cloud API client
+# ---------------------------------------------------------------------------
+
+
+class KelvinatorCloudClient:
+    """Async wrapper for BroadLink cloud discovery."""
 
     def __init__(
         self,
@@ -114,775 +180,155 @@ class BroadLinkCloudClient:
         timeout: int = 15,
     ) -> None:
         self._license_id = license_id
-        self._timeout = aiohttp.ClientTimeout(total=timeout)
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._headers = {
-            "Content-Type": "application/x-java-serialized-object",
-            "system": "android",
-            "appPlatform": "android",
-            "appVersion": "3.8.2",
-        }
-
-        # Locale — maps country code to BroadLink locate/language format
-        # From BLCommonUtils.getCountry() / getLanguage()
-        self._locate = country_code
         self._language = "en"
-
-        # -------------------------------------------------- Auth state
-
+        self._timeout = timeout
         self._userid: Optional[str] = None
         self._loginsession: Optional[str] = None
-        self._nickname: Optional[str] = None
 
-        # Family API state (uses separate encryption scheme)
-        self._family_server_key: Optional[str] = None
-        self._family_server_timestamp: Optional[str] = None
-        self._family_key_fetched_time: float = 0.0
-        self._FAMILY_KEY_TTL: int = 7200  # 2 hours, matching decompiled APK
-
-    # -------------------------------------------------- Session management
-
-    async def _ensure_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=self._timeout, headers=self._headers)
-        return self._session
-
-    async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    # -------------------------------------------------- URL helpers
-
-    def _account_url(self, path: str) -> str:
-        return BASE_ACCOUNT.format(self._license_id) + path
-
-    def _family_url(self, path: str) -> str:
-        return BASE_FAMILY.format(self._license_id) + path
-
-    def _electrolux_url(self, path: str) -> str:
-        return BASE_ELECTROLUX.format(self._license_id) + path
-
-    def _private_url(self, path: str) -> str:
-        return BASE_FAMILY_PRIVATE.format(self._license_id) + path
-
-    # -------------------------------------------------- Family API key management
-
-    async def _ensure_family_key(self) -> bool:
-        """
-        Fetch encryption key from /ec4/v1/common/api.
-        Key is cached for 2 hours (7200s) — matches decompiled APK.
-        """
-        now = time.time()
-        if (
-            self._family_server_key is not None
-            and (now - self._family_key_fetched_time) < self._FAMILY_KEY_TTL
-        ):
-            return True
-
-        url = self._family_url("/ec4/v1/common/api")
-        session = await self._ensure_session()
-        timestamp = str(int(time.time()))
-        headers = {
-            "system": "android",
-            "appPlatform": "android",
-            "language": self._language,
-            "timestamp": timestamp,
-        }
-        try:
-            _LOGGER.debug("GET %s", url)
-            async with session.get(url, headers=headers) as resp:
-                text = await resp.text()
-                _LOGGER.debug("Key response [%d]: %s", resp.status, text[:300])
-                data = json.loads(text)
-                if data.get("error") == 0:
-                    self._family_server_timestamp = str(data.get("timestamp", ""))
-                    self._family_server_key = data.get("key")
-                    self._family_key_fetched_time = now
-                    return True
-                _LOGGER.warning("Failed to fetch family API key: %s", data)
-                return False
-        except (aiohttp.ClientError, json.JSONDecodeError, KeyError) as exc:
-            _LOGGER.error("Failed to fetch family API key: %s", exc)
-            return False
-
-    def _make_family_token(self, plaintext: str) -> str:
-        """
-        Token for Family API: MD5(body + TOKEN_SALT + server_timestamp + userid)
-        Matches token calculation in decompiled j.java:
-          MD5(str2 = str + 'xgx3d*fe3478$ukx' + String.valueOf(this.g) + this.a)
-        """
-        raw = (
-            plaintext
-            + TOKEN_SALT
-            + (self._family_server_timestamp or "")
-            + (self._userid or "")
+    async def login(self, username: str, password: str) -> None:
+        """Log in to BroadLink cloud."""
+        user_id, login_session = await asyncio.to_thread(
+            _cloud_login_sync, self._license_id, username, password,
         )
-        return _md5(raw)
+        self._userid = user_id
+        self._loginsession = login_session
+        _LOGGER.info("Cloud login OK (uid=%s)", user_id)
 
-    def _encrypt_family_body(self, plaintext: str) -> bytes:
-        """
-        Family API uses server-provided hex key (NOT MD5-derived).
-        AES/CBC/ZeroBytePadding with hardcoded IV.
-        """
-        aes_key = bytes.fromhex(self._family_server_key or "")
-        data = plaintext.encode("utf-8")
-        cipher = AES.new(aes_key, AES.MODE_CBC, iv=AES_IV)
-        # ZeroBytePadding: pad with null bytes (0x00)
-        block_size = AES.block_size
-        padded_len = block_size * ((len(data) + block_size - 1) // block_size)
-        padded = data.ljust(padded_len, b"\x00")
-        return cipher.encrypt(padded)
-
-    # -------------------------------------------------- HTTP
-
-    async def _encrypted_post(self, url: str, body: dict, extra_headers: dict | None = None) -> dict:
-        """POST with AES-encrypted body and MD5 token header."""
-        session = await self._ensure_session()
-        timestamp = str(int(time.time()))
-        plaintext = json.dumps(body, separators=(",", ":"))
-        plaintext_bytes = plaintext.encode("utf-8")
-        ciphertext = _encrypt_body(plaintext, timestamp)
-        token = _make_token(plaintext_bytes)
-
-        headers = {
-            "timestamp": timestamp,
-            "token": token,
-            "language": self._language,
-        }
-        # Authenticated family API calls need loginsession + lid + userid
-        # (verified against mitmproxy capture)
-        if self._loginsession:
-            headers["loginsession"] = self._loginsession
-        if self._userid:
-            headers["userid"] = self._userid
-        headers["lid"] = self._license_id
-        if extra_headers:
-            headers.update(extra_headers)
-
-        _LOGGER.debug("POST %s body=%s", url, plaintext)
-        async with session.post(url, data=ciphertext, headers=headers) as resp:
-            text = await resp.text()
-            _LOGGER.debug("Response [%d]: %s", resp.status, text[:500])
-            return json.loads(text)
-
-    async def _family_encrypted_post(self, url: str, body: dict) -> dict:
-        """
-        Family-API encrypted POST.
-        Uses server-provided AES key instead of client-derived key.
-        Token includes salt + server_timestamp + userid.
-        """
-        session = await self._ensure_session()
-        if not await self._ensure_family_key():
-            return {"error": -1, "msg": "Failed to obtain family API encryption key"}
-
-        plaintext = json.dumps(body, separators=(",", ":"))
-        ciphertext = self._encrypt_family_body(plaintext)
-        token = self._make_family_token(plaintext)
-        timestamp = self._family_server_timestamp or str(int(time.time()))
-
-        headers = {
-            "timestamp": timestamp,
-            "token": token,
-            "language": self._language,
-            "userid": self._userid or "",
-            "loginsession": self._loginsession or "",
-            "lid": self._license_id,
-        }
-
-        _LOGGER.debug("Family POST %s body=%s", url, plaintext)
-        async with session.post(url, data=ciphertext, headers=headers) as resp:
-            text = await resp.text()
-            _LOGGER.debug("Family Response [%d]: %s", resp.status, text[:500])
-            if not text:
-                return {"error": -1, "msg": "Empty response"}
-            return json.loads(text)
-
-    # -------------------------------------------------- Auth
-
-    async def login(self, username: str, password: str) -> dict:
-        """Authenticate with BroadLink account. Raises on failure."""
-        body = {
-            "password": _hash_password(password),
-            "companyid": COMPANY_ID,
-        }
-        if "@" in username:
-            body["email"] = username
-        else:
-            body["phone"] = username
-
-        try:
-            result = await self._encrypted_post(
-                self._account_url("/account/login"), body
-            )
-        except aiohttp.ClientError as exc:
-            _LOGGER.error("Login request failed: %s", exc)
-            raise RuntimeError(f"Login request failed: {exc}") from exc
-
-        if result.get("error") != 0:
-            msg = result.get("msg", result.get("message", "Unknown error"))
-            raise RuntimeError(
-                f"Login failed: {msg} (code={result.get('error')})"
-            )
-
-        self._userid = result.get("userid")
-        self._loginsession = result.get("loginsession")
-        self._nickname = result.get("nickname")
-        _LOGGER.info("Logged in as %s (uid=%s)", self._nickname, self._userid)
-        return result
+    async def discover_devices(self) -> list[CloudDeviceInfo]:
+        """Discover all AC devices linked to this account."""
+        if not self._userid or not self._loginsession:
+            _LOGGER.error("Not authenticated")
+            return []
+        return await asyncio.to_thread(
+            _cloud_discover_sync,
+            self._license_id,
+            self._userid,
+            self._loginsession,
+            self._language,
+        )
 
     @property
     def userid(self) -> Optional[str]:
         return self._userid
 
-    # -------------------------------------------------- Device list
-
-    async def get_family_id_list(self) -> dict:
-        """Get all family IDs for this account. Matches /ec4/v1/user/getfamilyid."""
-        return await self._family_encrypted_post(
-            self._family_url("/ec4/v1/user/getfamilyid"),
-            {"userid": self._userid or ""},
-        )
-
-    async def get_family_all_info(self, family_ids: list[str]) -> dict:
-        """Get full family info including device list. Matches /ec4/v1/family/getallinfo."""
-        return await self._family_encrypted_post(
-            self._family_url("/ec4/v1/family/getallinfo"),
-            {
-                "userid": self._userid or "",
-                "familyid": family_ids,
-            },
-        )
-
-    async def list_devices(self) -> list[dict]:
-        """
-        Return all cloud-registered devices for the logged-in account.
-
-        Matches decompiled APK flow:
-          1. POST /ec4/v1/user/getfamilyid → familyinfo[].id
-          2. POST /ec4/v1/family/getallinfo (with array of family IDs)
-             → familyallinfo[].devinfo[]
-        """
-        devices: list[dict] = []
-        info = await self.get_family_id_list()
-        if info.get("error") != 0:
-            _LOGGER.warning("get_family_id_list failed: %s", info)
-            return []
-
-        families = info.get("familyinfo", [])
-        if not isinstance(families, list) or not families:
-            return []
-
-        family_ids = [fam.get("id", "") for fam in families if fam.get("id")]
-        if not family_ids:
-            return []
-
-        fam_info = await self.get_family_all_info(family_ids)
-        if fam_info.get("error") != 0:
-            _LOGGER.warning("get_family_all_info failed: %s", fam_info)
-            return []
-
-        all_info = fam_info.get("familyallinfo", [])
-        if isinstance(all_info, list):
-            for entry in all_info:
-                dev_list = entry.get("devinfo", [])
-                if isinstance(dev_list, list):
-                    for dev in dev_list:
-                        devices.append({
-                            "name": dev.get("name", ""),
-                            "mac": dev.get("mac", ""),
-                            "did": dev.get("did", ""),
-                            "pid": dev.get("pid", ""),
-                        })
-        return devices
-
-    # -------------------------------------------------- Private data (cloud relay state)
-
-    async def get_family_private_data_id(self) -> dict:
-        """
-        Get private data storage ID for this family.
-        POST /ec4/v1/family/privatedata/getid
-        """
-        return await self._family_encrypted_post(
-            self._private_url("/ec4/v1/family/privatedata/getid"),
-            {"mtag": "subdevinfo"},
-        )
-
-    async def query_private_data(self, family_id: str, mkeyid: str) -> dict:
-        """
-        Query private data by mkeyid.
-        POST /ec4/v1/family/privatedata/query
-        """
-        return await self._family_encrypted_post(
-            self._private_url("/ec4/v1/family/privatedata/query"),
-            {"familyid": family_id, "mtag": "subdevinfo", "mkeyid": mkeyid},
-        )
-
-    async def query_all_private_data(self, family_id: str) -> dict:
-        """
-        Query all private data for a family.
-        POST /ec4/v1/family/privatedata/queryall
-        """
-        return await self._family_encrypted_post(
-            self._private_url("/ec4/v1/family/privatedata/queryall"),
-            {"familyid": family_id},
-        )
-
-    async def update_private_data(
-        self, family_id: str, updates: list[dict]
-    ) -> dict:
-        """
-        Update private data entries.
-        POST /ec4/v1/family/privatedata/update
-        Each update: {"mtag": "subdevinfo", "mkeyid": str, "content": str, "idversion": str}
-        """
-        return await self._family_encrypted_post(
-            self._private_url("/ec4/v1/family/privatedata/update"),
-            {
-                "familyid": family_id,
-                "version": "",
-                "updatefamily": 0,
-                "datalist": updates,
-            },
-        )
-
 
 # ---------------------------------------------------------------------------
-# Cloud-only device model (no LAN required)
+# DNA cloud relay
 # ---------------------------------------------------------------------------
 
 
-class CloudACDevice:
-    """Represents a Kelvinator AC unit via cloud API only."""
+class DNACloudRelay:
+    """Cloud relay control using libNetworkAPI.so via kelvinator_dna.so_bridge."""
 
-    def __init__(
+    def __init__(self, so_path: str = _SO_PATH) -> None:
+        if not _SO_AVAILABLE:
+            raise RuntimeError(f"libNetworkAPI.so not found at {so_path}")
+        from kelvinator_dna.so_bridge import NetworkAPI
+        self._api = NetworkAPI(so_path)
+        self._api.sdk_init("{}")
+
+    def send_command(
         self,
-        cloud: BroadLinkCloudClient,
-        did: str,
-        mac: str,
-        name: str = "Kelvinator AC",
-        pid: str = "",
-    ) -> None:
-        self._cloud = cloud
-        self.did = did
-        self.mac = mac
-        self.name = name
-        self.pid = pid
-        self.state = AcDeviceState()
-        self.available = True
+        did: str, mac: str, aes_key: str, password: int, command_json: str,
+    ) -> dict:
+        result = self._api.dna_control(did, mac, aes_key, str(password), command_json)
+        return _json.loads(result)
+
+    def get_status(self, config_json: str) -> dict:
+        result = self._api.device_status_on_server(config_json)
+        return _json.loads(result)
 
 
 # ---------------------------------------------------------------------------
-# Device state model
-# ---------------------------------------------------------------------------
-
-
-class AcDeviceState:
-    """Full state of a Kelvinator AC unit, normalized for HA."""
-
-    __slots__ = (
-        "power", "mode", "target_temp", "fan_speed",
-        "swing_vertical", "swing_horizontal",
-        "sleep", "eco", "display_on", "temp_unit_celsius",
-        "ambient_temp", "error_code",
-        "temp_min_c", "temp_max_c",
-        "model_number", "serial_number",
-        "timer", "schedule_enabled", "schedule_time",
-    )
-
-    def __init__(self) -> None:
-        self.power: bool = False
-        self.mode: AcMode = AcMode.AUTO
-        self.target_temp: int = 24
-        self.fan_speed: FanSpeed = FanSpeed.AUTO
-        self.swing_vertical: bool = False
-        self.swing_horizontal: bool = False
-        self.sleep: bool = False
-        self.eco: bool = False
-        self.display_on: bool = True
-        self.temp_unit_celsius: bool = True
-        self.ambient_temp: float = 0.0
-        self.error_code: str = "0"
-        self.temp_min_c: int = 16
-        self.temp_max_c: int = 30
-        self.model_number: str = ""
-        self.serial_number: str = ""
-        self.timer: str = ""
-        self.schedule_enabled: bool = False
-        self.schedule_time: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Device client — wraps python-broadlink (LAN / cloud relay)
+# Device wrapper
 # ---------------------------------------------------------------------------
 
 
 class KelvinatorACDevice:
-    """Represents a single Kelvinator AC unit via BroadLink DNA protocol."""
+    """Kelvinator AC unit controlled via kelvinator_dna (cloud relay or local UDP)."""
 
     def __init__(
         self,
-        host: str,
-        mac: str,
-        name: str = "Kelvinator AC",
-        timeout: int = 5,
+        info: CloudDeviceInfo,
+        relay: Optional[DNACloudRelay] = None,
     ) -> None:
-        self._host = host
-        self._mac = mac
-        self._name = name
-        self._timeout = timeout
-        self._device: Any = None
+        self.info = info
+        self._relay = relay
         self.state = AcDeviceState()
-        self.available: bool = False
-
-    # -------------------------------------------------- Properties
+        self.available = True
 
     @property
     def name(self) -> str:
-        return self._name
+        return self.info.name
 
     @property
     def mac(self) -> str:
-        return self._mac
+        return self.info.mac
 
     @property
-    def host(self) -> str:
-        return self._host
-
-    # -------------------------------------------------- Connection
-
-    async def connect(self) -> bool:
-        """Connect to the device over LAN using python-broadlink."""
-        try:
-            import broadlink
-
-            self._device = await asyncio.to_thread(
-                broadlink.hello, self._host
-            )
-            if self._device is None:
-                _LOGGER.warning(
-                    "No BroadLink device at %s (MAC=%s)",
-                    self._host, self._mac,
-                )
-                self.available = False
-                return False
-
-            if hasattr(self._device, "auth"):
-                await asyncio.to_thread(self._device.auth)
-
-            self.available = True
-            _LOGGER.info(
-                "Connected to %s [%s] type=0x%04X",
-                self._name, self._mac, self._device.type,
-            )
-            return True
-
-        except Exception as exc:
-            _LOGGER.error("Failed to connect to %s: %s", self._name, exc)
-            self.available = False
-            return False
-
-    # -------------------------------------------------- State polling
+    def did(self) -> str:
+        return self.info.did
 
     async def update_state(self) -> bool:
-        """Query full device state. Returns True on success."""
-        if self._device is None:
-            if not await self.connect():
-                return False
-
+        if self._relay is None:
+            return True
         try:
-            if hasattr(self._device, "get_state"):
-                await asyncio.to_thread(self._device.get_state)
-            if hasattr(self._device, "check_sensors"):
-                await asyncio.to_thread(self._device.check_sensors)
-
-            self._parse_device_state()
-            self.available = True
-            return True
-
+            config = _json.dumps({
+                "did": self.did,
+                "mac": self.mac,
+                "aes_key": self.info.aes_key,
+                "password": self.info.password,
+            })
+            result = await asyncio.to_thread(self._relay.get_status, config)
+            if result.get("status") == 0:
+                data = result.get("data", {})
+                self.state.power = bool(data.get("ac_pwr", 0))
+                self.state.mode = data.get("ac_mode", 0)
+                self.state.target_temp = data.get("temp", 24)
+                self.state.fan = data.get("ac_mark", 0)
+                self.state.ambient_temp = float(data.get("envtemp", 0))
+                self.state.error_code = int(data.get("ac_errcode", 0))
+                self.state.swing = data.get("ac_vdir", 0)
+                self.state.sleep = bool(data.get("ac_slp", 0))
+                self.available = True
+                return True
         except Exception as exc:
-            _LOGGER.warning(
-                "Failed to update state for %s: %s", self._name, exc
-            )
+            _LOGGER.warning("Status query failed for %s: %s", self.name, exc)
             self.available = False
-            return False
-
-    def _parse_device_state(self) -> None:
-        """Extract Kelvinator params from broadlink device attributes."""
-        dev = self._device
-        if dev is None:
-            return
-
-        s = self.state
-        s.power = bool(getattr(dev, "power", s.power))
-
-        if hasattr(dev, "mode"):
-            try:
-                s.mode = AcMode(int(dev.mode))
-            except (ValueError, TypeError):
-                s.mode = AcMode.AUTO
-
-        if hasattr(dev, "temp"):
-            s.target_temp = int(dev.temp)
-
-        if hasattr(dev, "fan_speed"):
-            try:
-                s.fan_speed = FanSpeed(int(dev.fan_speed))
-            except (ValueError, TypeError):
-                s.fan_speed = FanSpeed.AUTO
-
-        s.swing_vertical = bool(getattr(dev, "swing_v", s.swing_vertical))
-        s.swing_horizontal = bool(getattr(dev, "swing_h", s.swing_horizontal))
-        s.sleep = bool(getattr(dev, "sleep", s.sleep))
-        s.eco = bool(getattr(dev, "eco", s.eco))
-        s.display_on = bool(getattr(dev, "display_on", s.display_on))
-        s.ambient_temp = float(getattr(dev, "room_temp", s.ambient_temp))
-
-        # Timer / schedule (read-only from LAN)
-        if hasattr(dev, "timer"):
-            s.timer = str(dev.timer or "")
-        if hasattr(dev, "schedule_enabled"):
-            s.schedule_enabled = bool(dev.schedule_enabled)
-        if hasattr(dev, "schedule_time"):
-            s.schedule_time = str(dev.schedule_time or "")
-
-    # -------------------------------------------------- Commands
-
-    async def _ensure_device(self) -> bool:
-        if self._device is not None:
-            return True
-        return await self.connect()
-
-    async def set_power(self, on: bool) -> bool:
-        if not await self._ensure_device():
-            return False
-        try:
-            dev = self._device
-            if hasattr(dev, "set_power"):
-                await asyncio.to_thread(dev.set_power, on)
-            elif hasattr(dev, "power"):
-                dev.power = on
-            self.state.power = on
-            return True
-        except Exception as exc:
-            _LOGGER.error("set_power(%s) failed: %s", on, exc)
-            self.available = False
-            return False
-
-    async def set_mode(self, mode: AcMode) -> bool:
-        if not await self._ensure_device():
-            return False
-        try:
-            dev = self._device
-            if hasattr(dev, "set_mode"):
-                await asyncio.to_thread(dev.set_mode, int(mode))
-            self.state.mode = mode
-            return True
-        except Exception as exc:
-            _LOGGER.error("set_mode(%s) failed: %s", mode, exc)
-            self.available = False
-            return False
-
-    async def set_temperature(self, temp_c: int) -> bool:
-        if not await self._ensure_device():
-            return False
-        try:
-            dev = self._device
-            target = max(self.state.temp_min_c, min(self.state.temp_max_c, temp_c))
-            if hasattr(dev, "set_temp"):
-                await asyncio.to_thread(dev.set_temp, target)
-            self.state.target_temp = target
-            return True
-        except Exception as exc:
-            _LOGGER.error("set_temperature(%d) failed: %s", temp_c, exc)
-            self.available = False
-            return False
-
-    async def set_fan_speed(self, speed: FanSpeed) -> bool:
-        if not await self._ensure_device():
-            return False
-        try:
-            dev = self._device
-            if hasattr(dev, "set_fan_speed"):
-                await asyncio.to_thread(dev.set_fan_speed, int(speed))
-            self.state.fan_speed = speed
-            return True
-        except Exception as exc:
-            _LOGGER.error("set_fan_speed(%s) failed: %s", speed, exc)
-            self.available = False
-            return False
-
-    async def set_swing_v(self, on: bool) -> bool:
-        if not await self._ensure_device():
-            return False
-        try:
-            dev = self._device
-            if hasattr(dev, "set_swing_v"):
-                await asyncio.to_thread(dev.set_swing_v, on)
-            self.state.swing_vertical = on
-            return True
-        except Exception as exc:
-            _LOGGER.error("set_swing_v(%s) failed: %s", on, exc)
-            self.available = False
-            return False
-
-    async def set_swing_h(self, on: bool) -> bool:
-        if not await self._ensure_device():
-            return False
-        try:
-            dev = self._device
-            if hasattr(dev, "set_swing_h"):
-                await asyncio.to_thread(dev.set_swing_h, on)
-            self.state.swing_horizontal = on
-            return True
-        except Exception as exc:
-            _LOGGER.error("set_swing_h(%s) failed: %s", on, exc)
-            self.available = False
-            return False
-
-    async def set_display(self, on: bool) -> bool:
-        """Toggle front panel display."""
-        if not await self._ensure_device():
-            return False
-        try:
-            dev = self._device
-            if hasattr(dev, "set_display"):
-                await asyncio.to_thread(dev.set_display, on)
-            self.state.display_on = on
-            return True
-        except Exception as exc:
-            _LOGGER.error("set_display(%s) failed: %s", on, exc)
-            self.available = False
-            return False
-
-    async def set_sleep(self, on: bool) -> bool:
-        """Toggle sleep mode."""
-        if not await self._ensure_device():
-            return False
-        try:
-            dev = self._device
-            if hasattr(dev, "set_sleep"):
-                await asyncio.to_thread(dev.set_sleep, on)
-            self.state.sleep = on
-            return True
-        except Exception as exc:
-            _LOGGER.error("set_sleep(%s) failed: %s", on, exc)
-            self.available = False
-            return False
-
-    async def set_eco(self, on: bool) -> bool:
-        """Toggle ECO mode."""
-        if not await self._ensure_device():
-            return False
-        try:
-            dev = self._device
-            if hasattr(dev, "set_eco"):
-                await asyncio.to_thread(dev.set_eco, on)
-            self.state.eco = on
-            return True
-        except Exception as exc:
-            _LOGGER.error("set_eco(%s) failed: %s", on, exc)
-            self.available = False
-            return False
-
-    async def set_hvac_mode(self, ha_mode: str) -> bool:
-        """Set HA HVAC mode. 'off' = power off, otherwise power on + set mode."""
-        if ha_mode == "off":
-            return await self.set_power(False)
-
-        kelvinator_mode = MODE_HA_TO_KELVINATOR.get(ha_mode)
-        if kelvinator_mode is None:
-            _LOGGER.warning("Unknown HVAC mode: %s", ha_mode)
-            return False
-
-        if not self.state.power:
-            if not await self.set_power(True):
-                return False
-        return await self.set_mode(kelvinator_mode)
-
-    async def set_fan_mode(self, ha_fan: str) -> bool:
-        """Set HA fan mode."""
-        speed = FAN_HA_TO_KELVINATOR.get(ha_fan)
-        if speed is None:
-            _LOGGER.warning("Unknown fan mode: %s", ha_fan)
-            return False
-        return await self.set_fan_speed(speed)
-
-    async def set_swing_mode(self, ha_swing: str) -> bool:
-        """Set HA swing mode."""
-        if ha_swing == "off":
-            rv = await self.set_swing_v(False)
-            rh = await self.set_swing_h(False)
-            return rv and rh
-        elif ha_swing == "vertical":
-            return await self.set_swing_v(True)
-        elif ha_swing == "horizontal":
-            return await self.set_swing_h(True)
-        elif ha_swing == "both":
-            rv = await self.set_swing_v(True)
-            rh = await self.set_swing_h(True)
-            return rv and rh
         return False
 
-
-# ---------------------------------------------------------------------------
-# Discovery helper
-# ---------------------------------------------------------------------------
-
-
-async def discover_devices(timeout: int = 5) -> list[KelvinatorACDevice]:
-    """Discover BroadLink DNA AC devices on the LAN via UDP broadcast."""
-    try:
-        import broadlink
-    except ImportError:
-        _LOGGER.error("broadlink library not installed")
-        return []
-
-    devices: list[KelvinatorACDevice] = []
-    try:
-        discovered = await asyncio.to_thread(broadlink.discover, timeout=timeout)
-    except Exception as exc:
-        _LOGGER.error("Discovery failed: %s", exc)
-        return []
-
-    for dev in discovered:
-        if dev.devtype in AC_DEVICE_TYPES:
-            host = dev.host[0]
-            mac = dev.mac.hex()
-            devices.append(
-                KelvinatorACDevice(
-                    host=host,
-                    mac=mac,
-                    name=f"Kelvinator-{mac[-4:]}",
-                )
+    async def send_command(self, params: dict) -> bool:
+        if self._relay is None:
+            _LOGGER.warning("No cloud relay available for %s", self.name)
+            return False
+        try:
+            cmd = _json.dumps({"did": self.did, "params": params})
+            result = await asyncio.to_thread(
+                self._relay.send_command,
+                did=self.did, mac=self.mac,
+                aes_key=self.info.aes_key, password=self.info.password,
+                command_json=cmd,
             )
-            _LOGGER.info("Discovered: %s at %s [0x%04X]", mac, host, dev.devtype)
+            return result.get("status") == 0
+        except Exception as exc:
+            _LOGGER.error("Command failed for %s: %s", self.name, exc)
+            return False
 
-    return devices
+
+# Backward compatibility alias
+CloudACDevice = KelvinatorACDevice
 
 
-async def probe_device(host: str, timeout: int = 5) -> KelvinatorACDevice | None:
-    """Directly probe a single IP address for a BroadLink AC device."""
-    try:
-        import broadlink
-    except ImportError:
-        _LOGGER.error("broadlink library not installed")
-        return None
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    try:
-        dev = await asyncio.to_thread(broadlink.hello, host)
-    except Exception as exc:
-        _LOGGER.error("Probe failed for %s: %s", host, exc)
-        return None
 
-    if dev is None:
-        _LOGGER.warning("No BroadLink device at %s", host)
-        return None
-
-    mac = dev.mac.hex()
-    _LOGGER.info("Probed device at %s: MAC=%s type=0x%04X", host, mac, dev.devtype)
-
-    return KelvinatorACDevice(
-        host=host,
-        mac=mac,
-        name=f"Kelvinator-{mac[-4:]}",
-    )
+def get_dna_relay() -> Optional[DNACloudRelay]:
+    """Get the DNA cloud relay if the native library is available."""
+    if _SO_AVAILABLE:
+        try:
+            return DNACloudRelay()
+        except Exception as exc:
+            _LOGGER.warning("Failed to init DNA relay: %s", exc)
+    return None

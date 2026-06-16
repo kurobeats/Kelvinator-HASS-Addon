@@ -1,7 +1,5 @@
 """
 Switch platform for Kelvinator Home Comfort integration.
-
-Exposes power, display, sleep, and eco toggles for each AC unit.
 """
 
 from __future__ import annotations
@@ -20,37 +18,12 @@ from .coordinator import KelvinatorCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Switch descriptions
-# ---------------------------------------------------------------------------
-
 SWITCH_TYPES: list[SwitchEntityDescription] = [
-    SwitchEntityDescription(
-        key="power",
-        name="Power",
-        icon="mdi:power",
-    ),
-    SwitchEntityDescription(
-        key="display",
-        name="Display",
-        icon="mdi:monitor-shimmer",
-    ),
-    SwitchEntityDescription(
-        key="sleep",
-        name="Sleep",
-        icon="mdi:sleep",
-    ),
-    SwitchEntityDescription(
-        key="eco",
-        name="ECO",
-        icon="mdi:leaf",
-    ),
+    SwitchEntityDescription(key="power", name="Power"),
+    SwitchEntityDescription(key="display", name="Display"),
+    SwitchEntityDescription(key="sleep", name="Sleep"),
+    SwitchEntityDescription(key="eco", name="Eco"),
 ]
-
-
-# ---------------------------------------------------------------------------
-# Platform setup
-# ---------------------------------------------------------------------------
 
 
 async def async_setup_entry(
@@ -58,57 +31,46 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Kelvinator switch entities from a config entry."""
     coordinator: KelvinatorCoordinator = hass.data[DOMAIN][entry.entry_id]
-
     entities: list[KelvinatorSwitch] = []
-    for mac, device in coordinator.devices.items():
+    for did, device in coordinator.devices.items():
         for desc in SWITCH_TYPES:
-            entities.append(KelvinatorSwitch(coordinator, mac, device, desc))
-
+            entities.append(KelvinatorSwitch(coordinator, did, device, desc))
     async_add_entities(entities)
 
-    # Dynamically add switches for newly discovered devices
     @callback
-    def _async_add_new_devices() -> None:
-        current_ids = {e.unique_id for e in entities}
-        new_entities: list[KelvinatorSwitch] = []
-        for mac, device in coordinator.devices.items():
+    def _add_new() -> None:
+        current = {(e._did, e._key) for e in entities}
+        new = []
+        for did, device in coordinator.devices.items():
             for desc in SWITCH_TYPES:
-                uid = f"kelvinator_ac_{mac.replace(':', '_').lower()}_{desc.key}"
-                if uid not in current_ids:
-                    entity = KelvinatorSwitch(coordinator, mac, device, desc)
-                    entities.append(entity)
-                    new_entities.append(entity)
-        if new_entities:
-            async_add_entities(new_entities)
+                if (did, desc.key) not in current:
+                    e = KelvinatorSwitch(coordinator, did, device, desc)
+                    entities.append(e)
+                    new.append(e)
+        if new:
+            async_add_entities(new)
 
-    coordinator.async_add_listener(_async_add_new_devices)
+    coordinator.async_add_listener(_add_new)
 
 
 class KelvinatorSwitch(SwitchEntity):
-    """Switch entity for a single Kelvinator AC unit property."""
-
     _attr_has_entity_name = True
 
     def __init__(
         self,
         coordinator: KelvinatorCoordinator,
-        mac: str,
+        did: str,
         device: CloudACDevice,
         description: SwitchEntityDescription,
     ) -> None:
-        """Initialize the switch."""
         self._coordinator = coordinator
-        self._mac = mac
+        self._did = did
         self._device = device
         self.entity_description = description
         self._key = description.key
-
-        self._attr_unique_id = (
-            f"kelvinator_ac_{mac.replace(':', '_').lower()}_{self._key}"
-        )
-        self._attr_name = f"{device.name} {description.name}"
+        mac_s = device.mac.replace(":", "_").lower()
+        self._attr_unique_id = f"kelvinator_ac_{mac_s}_{self._key}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, device.mac)},
             "name": device.name,
@@ -135,27 +97,32 @@ class KelvinatorSwitch(SwitchEntity):
         return False
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        await self._set_switch(True)
+        await self._toggle(True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self._set_switch(False)
+        await self._toggle(False)
 
-    async def _set_switch(self, on: bool) -> None:
-        dev = self._device
-        if self._key == "power":
-            await dev.set_power(on)
-        elif self._key == "display":
-            await dev.set_display(on)
-        elif self._key == "sleep":
-            await dev.set_sleep(on)
-        elif self._key == "eco":
-            await dev.set_eco(on)
-        await self._coordinator.async_request_refresh()
+    async def _toggle(self, on: bool) -> None:
+        key = self._key
+        s = self._device.state
+        if key == "power":
+            await self._device.send_command({"power": 1 if on else 0})
+            s.power = on
+        elif key == "display":
+            await self._device.send_command({"display": 1 if on else 0})
+            s.display_on = on
+        elif key == "sleep":
+            await self._device.send_command({"sleep": 1 if on else 0})
+            s.sleep = on
+        elif key == "eco":
+            await self._device.send_command({"eco": 1 if on else 0})
+            s.eco = on
+        self.async_write_ha_state()
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        if self._mac in self._coordinator.devices:
-            self._device = self._coordinator.devices[self._mac]
+        if self._did in self._coordinator.devices:
+            self._device = self._coordinator.devices[self._did]
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
