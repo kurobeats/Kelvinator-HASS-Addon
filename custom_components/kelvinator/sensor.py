@@ -1,7 +1,5 @@
 """
 Sensor platform for Kelvinator Home Comfort integration.
-
-Exposes read-only sensors: ambient temperature, error code, timer, schedule.
 """
 
 from __future__ import annotations
@@ -26,45 +24,27 @@ from .coordinator import KelvinatorCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Sensor descriptions
-# ---------------------------------------------------------------------------
-
 SENSOR_TYPES: list[SensorEntityDescription] = [
     SensorEntityDescription(
         key="ambient_temp",
         name="Ambient Temperature",
         device_class=SensorDeviceClass.TEMPERATURE,
-        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:thermometer",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
     ),
     SensorEntityDescription(
         key="error_code",
         name="Error Code",
-        icon="mdi:alert-circle",
     ),
     SensorEntityDescription(
         key="timer",
         name="Timer",
-        icon="mdi:timer-outline",
-    ),
-    SensorEntityDescription(
-        key="schedule_enabled",
-        name="Schedule",
-        icon="mdi:calendar-clock",
     ),
     SensorEntityDescription(
         key="schedule_time",
         name="Schedule Time",
-        icon="mdi:clock-outline",
     ),
 ]
-
-
-# ---------------------------------------------------------------------------
-# Platform setup
-# ---------------------------------------------------------------------------
 
 
 async def async_setup_entry(
@@ -72,57 +52,46 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Kelvinator sensor entities from a config entry."""
     coordinator: KelvinatorCoordinator = hass.data[DOMAIN][entry.entry_id]
-
     entities: list[KelvinatorSensor] = []
-    for mac, device in coordinator.devices.items():
+    for did, device in coordinator.devices.items():
         for desc in SENSOR_TYPES:
-            entities.append(KelvinatorSensor(coordinator, mac, device, desc))
-
+            entities.append(KelvinatorSensor(coordinator, did, device, desc))
     async_add_entities(entities)
 
-    # Dynamically add sensors for newly discovered devices
     @callback
-    def _async_add_new_devices() -> None:
-        current_ids = {e.unique_id for e in entities}
-        new_entities: list[KelvinatorSensor] = []
-        for mac, device in coordinator.devices.items():
+    def _add_new() -> None:
+        current = {(e._did, e._key) for e in entities}
+        new = []
+        for did, device in coordinator.devices.items():
             for desc in SENSOR_TYPES:
-                uid = f"kelvinator_ac_{mac.replace(':', '_').lower()}_{desc.key}"
-                if uid not in current_ids:
-                    entity = KelvinatorSensor(coordinator, mac, device, desc)
-                    entities.append(entity)
-                    new_entities.append(entity)
-        if new_entities:
-            async_add_entities(new_entities)
+                if (did, desc.key) not in current:
+                    e = KelvinatorSensor(coordinator, did, device, desc)
+                    entities.append(e)
+                    new.append(e)
+        if new:
+            async_add_entities(new)
 
-    coordinator.async_add_listener(_async_add_new_devices)
+    coordinator.async_add_listener(_add_new)
 
 
 class KelvinatorSensor(SensorEntity):
-    """Sensor entity for a single Kelvinator AC unit."""
-
     _attr_has_entity_name = True
 
     def __init__(
         self,
         coordinator: KelvinatorCoordinator,
-        mac: str,
+        did: str,
         device: CloudACDevice,
         description: SensorEntityDescription,
     ) -> None:
-        """Initialize the sensor."""
         self._coordinator = coordinator
-        self._mac = mac
+        self._did = did
         self._device = device
         self.entity_description = description
         self._key = description.key
-
-        self._attr_unique_id = (
-            f"kelvinator_ac_{mac.replace(':', '_').lower()}_{self._key}"
-        )
-        self._attr_name = f"{device.name} {description.name}"
+        mac_s = device.mac.replace(":", "_").lower()
+        self._attr_unique_id = f"kelvinator_ac_{mac_s}_{self._key}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, device.mac)},
             "name": device.name,
@@ -141,19 +110,17 @@ class KelvinatorSensor(SensorEntity):
         if self._key == "ambient_temp":
             return s.ambient_temp if s.ambient_temp > 0 else None
         elif self._key == "error_code":
-            return None if s.error_code == "0" else s.error_code
+            return None if s.error_code == 0 else str(s.error_code)
         elif self._key == "timer":
-            return s.timer or None
-        elif self._key == "schedule_enabled":
-            return "On" if s.schedule_enabled else "Off"
+            return None
         elif self._key == "schedule_time":
-            return s.schedule_time or None
+            return None
         return None
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        if self._mac in self._coordinator.devices:
-            self._device = self._coordinator.devices[self._mac]
+        if self._did in self._coordinator.devices:
+            self._device = self._coordinator.devices[self._did]
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
