@@ -13,6 +13,9 @@ import hashlib
 import json as _json
 import logging
 import os
+import re
+import socket
+import struct
 import threading
 import time
 from dataclasses import dataclass, field
@@ -335,22 +338,87 @@ class DNALocalRelay:
         return self._devices[did]
 
     def _discover_ip(self, mac: str) -> Optional[str]:
-        """Find the LAN IP for a given MAC address via UDP broadcast."""
+        """
+        Find the LAN IP for a given MAC address.
+
+        Tries in order:
+          1. Previously cached IP
+          2. ARP table (/proc/net/arp)
+          3. UDP broadcast probe (subnet-directed, then global)
+        """
         mac_lower = mac.lower()
         if mac_lower in self._ip_cache:
             return self._ip_cache[mac_lower]
 
+        # --- ARP table lookup (fast, no network traffic) ---
+        ip = self._lookup_arp(mac_lower)
+        if ip:
+            self._ip_cache[mac_lower] = ip
+            _LOGGER.info("ARP found: %s → %s", mac_lower, ip)
+            return ip
+
+        # --- UDP broadcast discovery ---
         from .kelvinator_dna.device import discover_devices
-        try:
-            devices = discover_devices(timeout=3.0)
-            for d in devices:
-                d_mac = d["mac"].lower()
-                self._ip_cache[d_mac] = d["ip"]
-                _LOGGER.info("LAN discovered: %s @ %s", d_mac, d["ip"])
-        except Exception as exc:
-            _LOGGER.debug("LAN discovery error: %s", exc)
+        for broadcast_ip in self._subnet_broadcasts():
+            try:
+                _LOGGER.debug("Probing broadcast %s", broadcast_ip)
+                devices = discover_devices(
+                    broadcast_ip=broadcast_ip, timeout=3.0,
+                )
+                for d in devices:
+                    d_mac = d["mac"].lower()
+                    self._ip_cache[d_mac] = d["ip"]
+                    _LOGGER.info("UDP discovered: %s @ %s", d_mac, d["ip"])
+            except Exception as exc:
+                _LOGGER.debug("Broadcast probe %s error: %s", broadcast_ip, exc)
 
         return self._ip_cache.get(mac_lower)
+
+    # ------------------------------------------------------------------
+    # Network helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _lookup_arp(mac_lower: str) -> Optional[str]:
+        """Look up a MAC address in the system ARP table."""
+        try:
+            with open("/proc/net/arp") as f:
+                for line in f.readlines()[1:]:  # skip header
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[3].lower() == mac_lower:
+                        return parts[0]
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _subnet_broadcasts() -> list[str]:
+        """
+        Return broadcast addresses for all local subnets, plus 255.255.255.255.
+        Detects subnet masks from local interfaces.
+        """
+        broadcasts = []
+        try:
+            with open("/proc/net/fib_trie") as f:
+                content = f.read()
+            for match in re.finditer(
+                r"(\d+\.\d+\.\d+\.\d+)/(\d+)", content
+            ):
+                ip = match.group(1)
+                prefix = int(match.group(2))
+                if prefix > 0:
+                    ip_int = struct.unpack(">I", socket.inet_aton(ip))[0]
+                    mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+                    bcast_int = ip_int | (~mask & 0xFFFFFFFF)
+                    bcast = socket.inet_ntoa(struct.pack(">I", bcast_int))
+                    if bcast not in broadcasts:
+                        broadcasts.append(bcast)
+        except Exception:
+            pass
+        # Always include global broadcast as last resort
+        if "255.255.255.255" not in broadcasts:
+            broadcasts.append("255.255.255.255")
+        return broadcasts
 
 
 # ---------------------------------------------------------------------------

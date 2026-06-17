@@ -96,9 +96,13 @@ Each AC unit creates these entities:
 │  │  │  │         → bizihcv0.ibroadlink.com    │  │ │
 │  │  │  ├─ KelvinatorACDevice                  │  │ │
 │  │  │  │   └─ send_command / update_state     │  │ │
-│  │  │  └─ DNACloudRelay (optional)            │  │ │
-│  │  │      └─ kelvinator_dna.so_bridge        │  │ │
-│  │  │         → libNetworkAPI.so               │  │ │
+│  │  │  └─ Relay (auto-selected)               │  │ │
+│  │  │      ├─ DNALocalRelay (default)         │  │ │
+│  │  │      │   → kelvinator_dna.device        │  │ │
+│  │  │      │      → UDP DNA protocol (LAN)    │  │ │
+│  │  │      └─ DNACloudRelay (fallback)        │  │ │
+│  │  │          → kelvinator_dna.so_bridge     │  │ │
+│  │  │             → libNetworkAPI.so           │  │ │
 │  │  └──────────────────┬──────────────────────┘  │ │
 │  │                     │                         │ │
 │  │  ┌──────────────────▼──────────────────────┐  │ │
@@ -112,20 +116,24 @@ Each AC unit creates these entities:
    │ BroadLink Cloud                              │   │
    │  ├─ bizaccount.ibroadlink.com               │   │
    │  │   → Account login (AES-encrypted)         │   │
-   │  ├─ bizihcv0.ibroadlink.com                 │   │
-   │  │   → Device discovery, AES keys, passwords │   │
-   │  └─ Cloud Relay (DNA protocol passthrough)   │   │
+   │  └─ bizihcv0.ibroadlink.com                 │   │
+   │      → Device discovery, AES keys, passwords │   │
    └─────────────────────────────────────────────┘   │
 ```
+
+Control uses **local UDP** by default via the pure-Python DNA protocol stack
+bundled in `kelvinator_dna.device`. The cloud relay (`libNetworkAPI.so`) is only
+a fallback — the file is included in the repository but is not required.
 
 ## How It Works
 
 1. **Login** — Authenticates against `bizaccount.ibroadlink.com` using AES-128-CBC encrypted credentials (matching the mobile app's login flow)
 2. **Discovery** — Retrieves device list, AES keys, and passwords from `bizihcv0.ibroadlink.com` via the bundled `kelvinator_dna.cloud` module
-3. **Control** — Sends DNA protocol commands through the cloud relay via `libNetworkAPI.so` (when available)
-4. **Status polling** — Queries device state on the configured poll interval
+3. **IP lookup** — Resolves each AC's LAN IP by checking the ARP table first, then falling back to subnet-directed UDP broadcast
+4. **Control** — Sends DNA protocol commands directly to the AC over UDP (LAN), using the pure-Python `kelvinator_dna.device` module
+5. **Status polling** — Queries device state on the configured poll interval via the same UDP path
 
-The bundled `kelvinator_dna` package contains a complete pure-Python implementation of the protocol stack — DNA packet framing, AES-128-ECB encryption, TFB serialization, and UDP device communication — available for future direct-LAN control.
+The bundled `kelvinator_dna` package contains a complete pure-Python implementation of the protocol stack — DNA packet framing, AES-128-ECB encryption, TFB serialization, and UDP device communication.
 
 ## Troubleshooting
 
@@ -139,12 +147,15 @@ The bundled `kelvinator_dna` package contains a complete pure-Python implementat
 
 - Log into the Kelvinator app on your phone and verify your AC units appear there
 - The integration can only discover devices registered to your cloud account
+- Check logs for "Cloud returned 0 device(s)" — this means the Family API returned no devices
 
-### Commands don't work / devices show default state
+### Commands don't work ("Cannot find LAN IP")
 
-- Device control currently requires `libNetworkAPI.so` (the BroadLink native library)
-- Check logs for "DNA relay not available" — this means the native library wasn't found or isn't compatible with your architecture
-- The `.so` file is architecture-specific; the version bundled may not match your platform
+- The integration resolves AC IPs from the system **ARP table** first (`/proc/net/arp`)
+- If the AC isn't in the ARP table, it falls back to subnet-directed UDP broadcast discovery
+- The AC must be on the **same broadcast domain** as Home Assistant for ARP/broadcast to work
+- Check logs for `"ARP found"` or `"UDP discovered"` messages to confirm IP resolution
+- If neither source works, verify the AC is powered on and connected to Wi-Fi
 
 ## Changelog
 
