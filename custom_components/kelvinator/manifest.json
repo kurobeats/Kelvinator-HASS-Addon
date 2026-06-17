@@ -9,7 +9,8 @@
     "iot_class": "local_polling",
     "issue_tracker": "https://github.com/kurobeats/Kelvinator-HASS-Addon/issues",
     "requirements": [
-        "pycryptodome>=3.19.0"
+        "pycryptodome>=3.19.0",
+        "broadlink>=0.19"
     ],
     "ssdp": [],
     "version": "2.0.0"

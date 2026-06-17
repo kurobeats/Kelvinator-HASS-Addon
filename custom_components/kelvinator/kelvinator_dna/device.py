@@ -253,10 +253,12 @@ class KelvinatorDevice:
         except Exception as e:
             logger.error(f"Authentication failed: {e}")
 
-        # Many devices don't require explicit auth — packets work anyway
-        logger.info("Auth not confirmed; proceeding without authentication")
-        self._authenticated = True
-        return True
+        # Many devices don't require explicit auth — send packets unencrypted.
+        # Setting _authenticated=False ensures _send_raw() does NOT encrypt
+        # payloads, which would fail since no session was established.
+        logger.info("Auth not confirmed; proceeding without encryption")
+        self._authenticated = False
+        return False
 
     def get_status(self) -> DeviceStatus:
         """
