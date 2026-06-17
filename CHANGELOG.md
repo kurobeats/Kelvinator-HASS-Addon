@@ -3,13 +3,16 @@
 ## 2.0.0 (2026-06-17)
 
 - Complete rewrite with bundled `kelvinator_dna` library (no unpublished pip dependencies)
-- Cloud-first architecture: login, device discovery, and control via BroadLink cloud API
+- Cloud-first architecture: login and device discovery via BroadLink cloud API
+- **Local UDP control** — sends DNA protocol commands directly to the AC over LAN (no cloud dependency for control)
+- `DNALocalRelay` — pure-Python UDP device control with ARP table + subnet broadcast IP discovery
+- `libNetworkAPI.so` included as optional cloud relay fallback (Android NDK binary — not loadable on standard Linux)
+- Multi-source IP resolution: ARP table → subnet broadcast → global broadcast
+- Fixed Family API device discovery (AES-encrypted JSON body, correct token formula)
 - Climate entity with mode, temperature, fan speed, and swing control
 - Switch entities: power, display, sleep, ECO per device
 - Sensor entities: ambient temperature, error code per device
 - Single-step config flow (username/password only)
-- DNA protocol integration via `libNetworkAPI.so` cloud relay
-- Pure-Python protocol implementation included for future direct-LAN control
 
 ## 1.0.0 (2026-06-14)
 
