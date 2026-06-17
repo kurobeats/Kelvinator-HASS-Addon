@@ -12,8 +12,6 @@ CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
 CONF_COUNTRY_CODE = "country_code"
 CONF_POLL_INTERVAL = "poll_interval"
-CONF_DEVICE_HOSTS = "device_hosts"
-CONF_ENABLE_DISCOVERY = "enable_discovery"
 
 DEFAULT_POLL_INTERVAL = 30
 DEFAULT_COUNTRY_CODE = "61"
@@ -29,7 +27,6 @@ AES_IV = bytes(
 TOKEN_SALT = "xgx3d*fe3478$ukx"
 TIMESTAMP_SALT = "kdixkdqp54545^#*"
 PASSWORD_SALT = "4969fj#k23#"
-KEY_PERMUTATION = [7, 12, 3, 0, 11, 15, 2, 4, 5, 9, 14, 1, 13, 10, 8, 6]
 DEFAULT_LICENSE_ID = "bddb4af53f74edaa03b1aa439b75e7a6"
 
 # Full base64 License from AirApplication.java — bytes 120:136 = companyid
@@ -40,13 +37,6 @@ FULL_LICENSE = (
 )
 import base64
 COMPANY_ID = base64.b64decode(FULL_LICENSE)[120:136].hex()
-
-# API base URLs
-BASE_ACCOUNT = "https://{}bizaccount.ibroadlink.com"
-BASE_FAMILY = "https://{}bizihcv0.ibroadlink.com"
-BASE_FAMILY_PRIVATE = "https://{}bizpd.ibroadlink.com"
-BASE_APP_MANAGE = "https://{}bizappmanage.ibroadlink.com"
-BASE_ELECTROLUX = "https://{}thirdpartyservice.ibroadlink.com"
 
 # ---------------------------------------------------------------------------
 # Kelvinator AC mode constants (from ACCommonUtils.java)
@@ -74,12 +64,6 @@ class FanSpeed(IntEnum):
     LOW_MED = 6
     MED_HIGH = 7
 
-
-# ---------------------------------------------------------------------------
-# BroadLink device type IDs
-# ---------------------------------------------------------------------------
-
-AC_DEVICE_TYPES = (0x4E2A, 0x4E2B, 0x4E2C)
 
 # ---------------------------------------------------------------------------
 # Maps: Kelvinator ↔ HA

@@ -8,21 +8,12 @@
                     "username": "Email or phone number",
                     "password": "Password",
                     "country_code": "Country code (61=AU, 64=NZ)",
-                    "poll_interval": "Poll interval (seconds)",
-                    "enable_discovery": "Enable LAN discovery"
-                }
-            },
-            "devices": {
-                "title": "Device IP Addresses",
-                "description": "Enter your AC unit IP addresses, separated by commas.\nExample: {example}\n\nLeave blank to rely on LAN discovery only.",
-                "data": {
-                    "device_hosts": "IP Addresses"
+                    "poll_interval": "Poll interval (seconds)"
                 }
             }
         },
         "error": {
-            "enter_at_least_one_ip": "Enter at least one IP address, or enable LAN discovery.",
-            "no_device_responded": "No BroadLink device responded at any of the IPs you entered. Check the addresses and try again."
+            "invalid_auth": "Login failed. Check your credentials."
         },
         "abort": {
             "already_configured": "This account is already configured."
@@ -32,11 +23,9 @@
         "step": {
             "init": {
                 "title": "Settings",
-                "description": "Manage your Kelvinator AC devices.\nAdd or remove IP addresses separated by commas.\nExample: {example}",
+                "description": "Adjust the polling interval for device updates.",
                 "data": {
-                    "device_hosts": "Device IP Addresses",
-                    "poll_interval": "Poll interval (seconds)",
-                    "enable_discovery": "Enable LAN discovery"
+                    "poll_interval": "Poll interval (seconds)"
                 }
             }
         }

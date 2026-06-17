@@ -2,7 +2,7 @@
 Kelvinator Home Comfort integration for Home Assistant.
 
 Control Kelvinator/Electrolux air conditioners via BroadLink DNA protocol.
-Uses kelvinator-dna library for cloud discovery and device control.
+Uses the bundled kelvinator_dna package for cloud discovery and device control.
 """
 
 from __future__ import annotations

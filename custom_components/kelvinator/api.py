@@ -1,7 +1,7 @@
 """
 Kelvinator Home Comfort — API layer.
 
-Uses the kelvinator-dna library for:
+Uses the bundled kelvinator_dna package for:
   - Cloud device discovery (HTTPS REST API via kelvinator_dna.cloud)
   - DNA protocol control (UDP or cloud relay via libNetworkAPI.so)
 """
@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from .const import DEFAULT_LICENSE_ID
+from .const import DEFAULT_LICENSE_ID, COMPANY_ID, AES_IV, PASSWORD_SALT, TIMESTAMP_SALT, TOKEN_SALT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,16 +76,6 @@ class AcDeviceState:
 # ---------------------------------------------------------------------------
 
 
-def _get_company_id() -> str:
-    import base64
-    FULL_LICENSE = (
-        "vdtK9T907aoDsapDm3Xnpviv67CfTNVaCnBaVHLbiTo0j+/RvjQpBrWd6wi3wqkc"
-        "5OkMWgAAAACYJzsfBji8eBl5PVjaBV0221pCDlvjSasStCYcZJK9YB8Ze5skOd3JxQ"
-        "artvnM1yncOPqd/5kKHxJ0Y7b4U5AFg/vh4BVg6qjaYHnfiJKkvAAAAAA="
-    )
-    return base64.b64decode(FULL_LICENSE)[120:136].hex()
-
-
 def _cloud_login_sync(
     license_id: str, username: str, password: str,
 ) -> tuple[str, str]:
@@ -93,25 +83,22 @@ def _cloud_login_sync(
     from Crypto.Cipher import AES
     from Crypto.Util.Padding import pad
 
-    IV = bytes([0xEA, 0xAA, 0xAA, 0x3A, 0xBB, 0x58, 0x62, 0xA2,
-                0x19, 0x18, 0xB5, 0x77, 0x1D, 0x16, 0x15, 0xAA])
-
     ts = str(int(time.time()))
-    pw_sha256 = hashlib.sha256((password + "4969fj#k23#").encode()).hexdigest().lower()
+    pw_sha256 = hashlib.sha256((password + PASSWORD_SALT).encode()).hexdigest().lower()
     pw_hash = hashlib.sha1(pw_sha256.encode()).hexdigest().lower()
 
     body = _json.dumps({
         "phone" if username.isdigit() else "email": username,
         "password": pw_hash,
-        "companyid": _get_company_id(),
+        "companyid": COMPANY_ID,
     }, separators=(",", ":"))
 
     aes_key = bytes.fromhex(hashlib.md5(
-        (ts + "kdixkdqp54545^#*").encode()
+        (ts + TIMESTAMP_SALT).encode()
     ).hexdigest().lower())
-    cipher = AES.new(aes_key, AES.MODE_CBC, iv=IV)
+    cipher = AES.new(aes_key, AES.MODE_CBC, iv=AES_IV)
     encrypted = cipher.encrypt(pad(body.encode(), AES.block_size))
-    token = hashlib.md5(body.encode() + b"xgx3d*fe3478$ukx").hexdigest().lower()
+    token = hashlib.md5(body.encode() + TOKEN_SALT.encode()).hexdigest().lower()
 
     import urllib.request
     import ssl
@@ -138,7 +125,7 @@ def _cloud_discover_sync(
     license_id: str, user_id: str, login_session: str, language: str,
 ) -> list[CloudDeviceInfo]:
     """Blocking cloud device discovery using kelvinator_dna.cloud."""
-    from kelvinator_dna.cloud import KelvinatorCloud
+    from .kelvinator_dna.cloud import KelvinatorCloud
 
     cloud = KelvinatorCloud(
         license_id=license_id,
@@ -223,7 +210,7 @@ class DNACloudRelay:
     def __init__(self, so_path: str = _SO_PATH) -> None:
         if not _SO_AVAILABLE:
             raise RuntimeError(f"libNetworkAPI.so not found at {so_path}")
-        from kelvinator_dna.so_bridge import NetworkAPI
+        from .kelvinator_dna.so_bridge import NetworkAPI
         self._api = NetworkAPI(so_path)
         self._api.sdk_init("{}")
 
