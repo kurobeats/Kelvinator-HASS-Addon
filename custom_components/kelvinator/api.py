@@ -232,16 +232,25 @@ class DNACloudRelay:
 
 class DNALocalRelay:
     """
-    Local UDP control using the pure-Python DNA protocol implementation.
+    Local UDP control using python-broadlink for transport.
 
-    Falls back to LAN discovery when the native libNetworkAPI.so is unavailable.
-    Each device gets a persistent UDP socket and an asyncio lock for thread safety.
+    Uses the standard BroadLink protocol (hello → auth → send_packet(0x6A, …))
+    which these Electrolux/Kelvinator ACs (devtype 0x4F9B/20379) speak natively.
+
+    AC commands are serialised as JSON mimicking the Java BLStdControlParam
+    structure that the official Electrolux app passes to dnaControl():
+      {"act": "get|set", "params": ["ac_pwr", …], "vals": [[…], …]}
+
+    The payload is AES-128-CBC encrypted with the per-device cloud key
+    (same key retrieved from the BroadLink cloud API).
     """
 
+    # Devtype for Electrolux / Kelvinator AC units
+    AC_DEVTYPE = 0x4F9B  # 20379
+
     def __init__(self) -> None:
-        self._devices: dict[str, "KelvinatorDevice"] = {}
+        self._devices: dict[str, "_BroadlinkDevice"] = {}
         self._lock = threading.Lock()
-        self._ip_cache: dict[str, str] = {}  # mac_lower → ip
 
     # ------------------------------------------------------------------
     # Public interface (matches DNACloudRelay)
@@ -253,26 +262,28 @@ class DNALocalRelay:
     ) -> dict:
         """Send a control command to the device via local UDP."""
         try:
-            dev = self._get_device(did, mac, aes_key, password)
+            dev = self._get_device(did, mac, aes_key)
             cmd = _json.loads(command_json)
             params: dict = cmd.get("params", {})
 
-            if "power" in params:
-                dev.set_power(bool(params["power"]))
-            if "mode" in params:
-                dev.set_mode(int(params["mode"]))
-            if "temp" in params:
-                dev.set_temperature(int(params["temp"]))
-            if "fan" in params:
-                dev.set_fan_speed(int(params["fan"]))
-            if "vdir" in params or "hdir" in params:
-                v = int(params.get("vdir", 0))
-                h = int(params.get("hdir", 0))
-                dev.set_swing((1 if v else 0) | (2 if h else 0))
-            if "sleep" in params:
-                dev.set_sleep(bool(params["sleep"]))
+            # Build BLStdControlParam-style param/vals
+            param_names: list[str] = []
+            vals: list[list[dict]] = []
 
-            dev.send_control()
+            for key, val in params.items():
+                param_names.append(key)
+                vals.append([{"idx": 1, "val": int(val) if isinstance(val, (int, bool)) else val}])
+
+            if not param_names:
+                return {"status": 0}
+
+            pkt = _json.dumps({
+                "act": "set",
+                "params": param_names,
+                "vals": vals,
+            }, separators=(",", ":"))
+
+            self._send_encrypted(dev, pkt)
             return {"status": 0}
         except Exception as exc:
             _LOGGER.error("Local command failed for %s: %s", mac, exc)
@@ -285,22 +296,30 @@ class DNALocalRelay:
             did = config["did"]
             mac = config["mac"]
             aes_key = config["aes_key"]
-            password = int(config["password"])
 
-            dev = self._get_device(did, mac, aes_key, password)
-            status = dev.get_status()
+            dev = self._get_device(did, mac, aes_key)
 
+            pkt = _json.dumps({"act": "get"}, separators=(",", ":"))
+            resp = self._send_encrypted(dev, pkt)
+
+            result = _json.loads(resp)
+            if result.get("status") != 0:
+                _LOGGER.warning("Status query returned error: %s", result)
+                return {"status": -1, "message": result.get("msg", "Unknown error")}
+
+            raw = result.get("data", {})
             return {
                 "status": 0,
                 "data": {
-                    "ac_pwr": 1 if status.power else 0,
-                    "ac_mode": status.mode,
-                    "temp": status.temp,
-                    "ac_mark": status.fan,
-                    "envtemp": status.room_temp or 0,
-                    "ac_errcode": status.error_code,
-                    "ac_vdir": status.swing,
-                    "ac_slp": 1 if status.sleep else 0,
+                    "ac_pwr": int(raw.get("ac_pwr", 0)),
+                    "ac_mode": int(raw.get("ac_mode", 0)),
+                    "temp": int(float(raw.get("temp", 24))),
+                    "ac_mark": int(raw.get("ac_mark", 0)),
+                    "envtemp": float(raw.get("envtemp", 0)),
+                    "ac_errcode": int(raw.get("ac_errcode", 0)),
+                    "ac_vdir": int(raw.get("ac_vdir", 0)),
+                    "ac_slp": int(raw.get("ac_slp", 0)),
+                    "ac_hdir": int(raw.get("ac_hdir", 0)),
                 },
             }
         except Exception as exc:
@@ -311,10 +330,31 @@ class DNALocalRelay:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _send_encrypted(self, dev: "_BroadlinkDevice", plaintext: str) -> str:
+        """Encrypt JSON, send via 0x6A, decrypt response."""
+        import broadlink
+
+        payload = plaintext.encode("utf-8")
+        # Pad to 16-byte boundary with PKCS#7
+        pad_len = 16 - (len(payload) % 16)
+        payload += bytes([pad_len] * pad_len)
+
+        encrypted = dev._encrypt(payload)
+        resp = dev.broadlink.send_packet(0x6A, encrypted)
+        broadlink.exceptions.check_error(resp[0x22:0x24])
+
+        decrypted = dev._decrypt(resp[0x38:])
+        # Remove PKCS#7 padding
+        if decrypted:
+            pad_len = decrypted[-1]
+            if 1 <= pad_len <= 16:
+                decrypted = decrypted[:-pad_len]
+        return decrypted.decode("utf-8")
+
     def _get_device(
-        self, did: str, mac: str, aes_key: str, password: int,
-    ) -> "KelvinatorDevice":
-        """Get or create a local KelvinatorDevice for the given MAC/DID."""
+        self, did: str, mac: str, aes_key: str,
+    ) -> "_BroadlinkDevice":
+        """Get or create a BroadLink device wrapper for the given MAC/DID."""
         dev = self._devices.get(did)
         if dev is not None:
             return dev
@@ -327,63 +367,35 @@ class DNALocalRelay:
                     f"Cannot find LAN IP for {mac}. "
                     f"Make sure the AC is on the same network as Home Assistant."
                 )
-            from .kelvinator_dna.device import KelvinatorDevice
-            dev = KelvinatorDevice(
-                ip=ip, did=did, mac=mac, aes_key=aes_key, password=password,
+            dev = _BroadlinkDevice(
+                ip=ip, mac=mac, aes_key=aes_key, devtype=self.AC_DEVTYPE,
             )
             dev.connect()
-            dev.authenticate()
             self._devices[did] = dev
             _LOGGER.info("Local device connected: %s @ %s", mac, ip)
         return self._devices[did]
 
     def _discover_ip(self, mac: str) -> Optional[str]:
-        """
-        Find the LAN IP for a given MAC address.
+        """Find the LAN IP for a given MAC address."""
+        import broadlink
 
-        Tries in order:
-          1. Previously cached IP
-          2. ARP table (/proc/net/arp)
-          3. UDP broadcast probe (subnet-directed, then global)
-        """
         mac_lower = mac.lower()
-        if mac_lower in self._ip_cache:
-            return self._ip_cache[mac_lower]
 
-        # --- ARP table lookup (fast, no network traffic) ---
-        ip = self._lookup_arp(mac_lower)
-        if ip:
-            self._ip_cache[mac_lower] = ip
-            _LOGGER.info("ARP found: %s → %s", mac_lower, ip)
-            return ip
-
-        # --- UDP broadcast discovery ---
-        from .kelvinator_dna.device import discover_devices
-        for broadcast_ip in self._subnet_broadcasts():
+        # Try direct hello (the device IS on the same subnet)
+        for ip_suffix in range(150, 160):
+            ip = f"172.16.23.{ip_suffix}"
             try:
-                _LOGGER.debug("Probing broadcast %s", broadcast_ip)
-                devices = discover_devices(
-                    broadcast_ip=broadcast_ip, timeout=3.0,
-                )
-                for d in devices:
-                    d_mac = d["mac"].lower()
-                    self._ip_cache[d_mac] = d["ip"]
-                    _LOGGER.info("UDP discovered: %s @ %s", d_mac, d["ip"])
-            except Exception as exc:
-                _LOGGER.debug("Broadcast probe %s error: %s", broadcast_ip, exc)
+                dev = broadlink.hello(ip, port=80, timeout=2)
+                if dev.mac.hex().lower() == mac_lower:
+                    _LOGGER.info("Discovered: %s @ %s", mac, ip)
+                    return ip
+            except Exception:
+                pass
 
-        return self._ip_cache.get(mac_lower)
-
-    # ------------------------------------------------------------------
-    # Network helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _lookup_arp(mac_lower: str) -> Optional[str]:
-        """Look up a MAC address in the system ARP table."""
+        # Fall back to ARP
         try:
             with open("/proc/net/arp") as f:
-                for line in f.readlines()[1:]:  # skip header
+                for line in f.readlines()[1:]:
                     parts = line.split()
                     if len(parts) >= 4 and parts[3].lower() == mac_lower:
                         return parts[0]
@@ -391,34 +403,54 @@ class DNALocalRelay:
             pass
         return None
 
-    @staticmethod
-    def _subnet_broadcasts() -> list[str]:
-        """
-        Return broadcast addresses for all local subnets, plus 255.255.255.255.
-        Detects subnet masks from local interfaces.
-        """
-        broadcasts = []
-        try:
-            with open("/proc/net/fib_trie") as f:
-                content = f.read()
-            for match in re.finditer(
-                r"(\d+\.\d+\.\d+\.\d+)/(\d+)", content
-            ):
-                ip = match.group(1)
-                prefix = int(match.group(2))
-                if prefix > 0:
-                    ip_int = struct.unpack(">I", socket.inet_aton(ip))[0]
-                    mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
-                    bcast_int = ip_int | (~mask & 0xFFFFFFFF)
-                    bcast = socket.inet_ntoa(struct.pack(">I", bcast_int))
-                    if bcast not in broadcasts:
-                        broadcasts.append(bcast)
-        except Exception:
-            pass
-        # Always include global broadcast as last resort
-        if "255.255.255.255" not in broadcasts:
-            broadcasts.append("255.255.255.255")
-        return broadcasts
+
+class _BroadlinkDevice:
+    """Thin wrapper around a python-broadlink Device with cloud-key encryption."""
+
+    # Hardcoded AES IV (same for ALL BroadLink devices)
+    _IV = bytes.fromhex("562e17996d093d28ddb3ba695a2e6f58")
+
+    def __init__(self, ip: str, mac: str, aes_key: str, devtype: int) -> None:
+        self.ip = ip
+        self.mac = mac
+        self._devtype = devtype
+        self.broadlink = None
+
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.backends import default_backend
+        self._aes_key = bytes.fromhex(aes_key)
+        self._Cipher = Cipher
+        self._algorithms = algorithms
+        self._modes = modes
+        self._default_backend = default_backend
+
+    def connect(self) -> None:
+        """Discover and authenticate with the device."""
+        import broadlink
+
+        self.broadlink = broadlink.hello(self.ip, port=80, timeout=5)
+        self.broadlink.auth()
+        _LOGGER.info("BroadLink auth OK for %s (id=%s)", self.ip, self.broadlink.id)
+
+    def _encrypt(self, data: bytes) -> bytes:
+        """AES-128-CBC encrypt with the cloud key."""
+        cipher = self._Cipher(
+            self._algorithms.AES(self._aes_key),
+            self._modes.CBC(self._IV),
+            backend=self._default_backend(),
+        )
+        encryptor = cipher.encryptor()
+        return encryptor.update(data) + encryptor.finalize()
+
+    def _decrypt(self, data: bytes) -> bytes:
+        """AES-128-CBC decrypt with the cloud key."""
+        cipher = self._Cipher(
+            self._algorithms.AES(self._aes_key),
+            self._modes.CBC(self._IV),
+            backend=self._default_backend(),
+        )
+        decryptor = cipher.decryptor()
+        return decryptor.update(data) + decryptor.finalize()
 
 
 # ---------------------------------------------------------------------------
