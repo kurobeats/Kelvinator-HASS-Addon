@@ -21,12 +21,28 @@ API Endpoints:
 
 import hashlib
 import json
+import logging
 import time
 import urllib.request
 import urllib.error
 import ssl
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
+
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+
+_LOGGER = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# AES constants (from decompiled BroadLink SDK)
+# ---------------------------------------------------------------------------
+
+AES_IV = bytes(
+    [0xEA, 0xAA, 0xAA, 0x3A, 0xBB, 0x58, 0x62, 0xA2,
+     0x19, 0x18, 0xB5, 0x77, 0x1D, 0x16, 0x15, 0xAA]
+)
+TOKEN_SALT = "xgx3d*fe3478$ukx"
 
 
 @dataclass
@@ -62,6 +78,7 @@ class CloudCredentials:
     login_session: str  # 32-char hex session token
     api_key: str = ""   # API key from initial handshake
     token: str = ""     # Auth token for subsequent requests
+    server_timestamp: int = 0  # Timestamp from /ec4/v1/common/api response
 
 
 class KelvinatorCloud:
@@ -107,6 +124,8 @@ class KelvinatorCloud:
         self.system = system
         self.app_platform = app_platform
         self.language = language
+        self._family_id: str = ""
+        self._server_key: bytes = b""
         self.user_agent = (
             f"Dalvik/2.1.0 (Linux; U; Android 16; SM-S926B Build/BP4A.251205.006)"
         )
@@ -164,16 +183,14 @@ class KelvinatorCloud:
         """
         Perform cloud authentication.
 
-        1. Get API key from /ec4/v1/common/api
-        2. Get family ID from /ec4/v1/user/getfamilyid
-        3. Get full device info from /ec4/v1/family/getallinfo
+        1. Get API key and server timestamp from /ec4/v1/common/api
 
         Returns:
             API key string
         """
         timestamp = int(time.time())
 
-        # Step 1: Get API key
+        # Step 1: Get API key and server timestamp
         headers = {
             "system": self.system,
             "appPlatform": self.app_platform,
@@ -183,6 +200,9 @@ class KelvinatorCloud:
         }
         resp = self._make_request("GET", "/ec4/v1/common/api", extra_headers=headers)
         self.credentials.api_key = resp.get("key", "")
+        self.credentials.server_timestamp = resp.get("timestamp", timestamp)
+        self._server_key = b""  # reset so _encrypt_family_body picks up new key
+        _LOGGER.info("Family API key obtained (server_ts=%d)", self.credentials.server_timestamp)
         return self.credentials.api_key
 
     def get_family_id(self) -> str:
@@ -190,64 +210,58 @@ class KelvinatorCloud:
         Get the family (home) ID for the user.
 
         Requires: login_session, user_id, license_id to be set.
+        Requires: authenticate() to have been called first.
 
         Returns:
             Family ID string
         """
-        timestamp = int(time.time())
+        timestamp = self.credentials.server_timestamp or int(time.time())
 
-        headers = {
-            "Content-type": "application/x-java-serialized-object",
-            "system": self.system,
-            "appPlatform": self.app_platform,
-            "language": self.language,
-            "loginsession": self.credentials.login_session,
-            "lid": self.credentials.license_id,
-            "userid": self.credentials.user_id,
-            "timestamp": str(timestamp),
-            "token": self._generate_token(),
-            "Host": self.API_HOST,
-        }
-
-        # Build the Java serialized object body
-        # This is a simplified version; the real body is Java ObjectOutputStream
-        body = self._build_java_serialized_body("getfamilyid")
+        body_json = json.dumps(
+            {"userid": self.credentials.user_id}, separators=(",", ":")
+        )
+        encrypted_body = self._encrypt_family_body(body_json)
+        headers = self._build_family_headers(body_json, timestamp)
 
         resp = self._make_request(
-            "POST", "/ec4/v1/user/getfamilyid", body=body, extra_headers=headers
+            "POST", "/ec4/v1/user/getfamilyid",
+            body=encrypted_body, extra_headers=headers,
         )
 
         family_info = resp.get("familyinfo", [])
         if family_info:
+            _LOGGER.info("Family ID: %s", family_info[0].get("id"))
             return family_info[0].get("id", "")
+        _LOGGER.warning("No family info in response: %s", resp)
         return ""
 
     def get_all_devices(self) -> Dict[str, Any]:
         """
         Get all device information including AES keys.
 
+        Automatically discovers the family ID if not cached.
+
         Returns:
             Full API response with family, rooms, devices, and modules
         """
-        timestamp = int(time.time())
+        if not self._family_id:
+            self._family_id = self.get_family_id()
+        if not self._family_id:
+            _LOGGER.error("Cannot get devices: no family ID")
+            return {}
 
-        headers = {
-            "Content-type": "application/x-java-serialized-object",
-            "system": self.system,
-            "appPlatform": self.app_platform,
-            "language": self.language,
-            "loginsession": self.credentials.login_session,
-            "lid": self.credentials.license_id,
+        timestamp = self.credentials.server_timestamp or int(time.time())
+
+        body_json = json.dumps({
             "userid": self.credentials.user_id,
-            "timestamp": str(timestamp),
-            "token": self._generate_token(),
-            "Host": self.API_HOST,
-        }
-
-        body = self._build_java_serialized_body("getallinfo")
+            "familyid": [self._family_id],
+        }, separators=(",", ":"))
+        encrypted_body = self._encrypt_family_body(body_json)
+        headers = self._build_family_headers(body_json, timestamp)
 
         return self._make_request(
-            "POST", "/ec4/v1/family/getallinfo", body=body, extra_headers=headers
+            "POST", "/ec4/v1/family/getallinfo",
+            body=encrypted_body, extra_headers=headers,
         )
 
     def discover_devices(self) -> List[DeviceInfo]:
@@ -292,43 +306,49 @@ class KelvinatorCloud:
 
         return devices
 
-    def _generate_token(self) -> str:
-        """
-        Generate an authentication token based on the session state.
+    # -----------------------------------------------------------------------
+    # Family API helpers (AES encryption + token generation)
+    # -----------------------------------------------------------------------
 
-        The token is derived from the login session and user credentials.
-        This is a placeholder — the actual algorithm uses the native library.
+    def _encrypt_family_body(self, plaintext: str) -> bytes:
         """
-        # In practice, the token is computed by libNetworkAPI.so
-        # We return a dummy for offline use
-        material = f"{self.credentials.login_session}{self.credentials.user_id}"
+        AES-CBC encrypt the JSON body using the server key from /ec4/v1/common/api.
+
+        Key = raw bytes of server key hex string
+        IV = hardcoded BroadLink IV
+        Padding = PKCS7 (via pycryptodome pad)
+        """
+        if not self._server_key:
+            self._server_key = bytes.fromhex(self.credentials.api_key)
+        cipher = AES.new(self._server_key, AES.MODE_CBC, iv=AES_IV)
+        return cipher.encrypt(pad(plaintext.encode(), AES.block_size))
+
+    def _generate_family_token(self, plaintext: str, timestamp: int) -> str:
+        """
+        Generate token for Family API endpoints.
+
+        Formula (from decompiled BroadLink SDK class j.java):
+            MD5(plaintext_json + TOKEN_SALT + timestamp + userid)
+        """
+        material = (
+            plaintext + TOKEN_SALT + str(timestamp) + self.credentials.user_id
+        )
         return hashlib.md5(material.encode()).hexdigest()
 
-    def _build_java_serialized_body(self, action: str) -> bytes:
-        """
-        Build a Java ObjectOutputStream serialized body.
-
-        The cloud API accepts application/x-java-serialized-object content.
-        The body contains encrypted parameter data.
-
-        Note: Full reverse-engineering of the Java serialization is complex.
-        In practice, this library is designed to work with cached credentials.
-        For a full implementation, you would use Java's ObjectOutputStream or
-        a Python equivalent.
-
-        Args:
-            action: API action name
-
-        Returns:
-            Java serialized bytes
-        """
-        # Placeholder: return minimal body
-        # The actual body contains:
-        #  - Magic: 0xACED (Java serialization stream magic)
-        #  - Version: 0x0005
-        #  - TC_OBJECT with encrypted fields
-        # For now, return empty — callers should use cached credentials
-        return b""
+    def _build_family_headers(self, plaintext: str, timestamp: int) -> Dict[str, str]:
+        """Build common headers for Family API (/ec4/v1/) POST requests."""
+        return {
+            "Content-type": "application/x-java-serialized-object",
+            "system": self.system,
+            "appPlatform": self.app_platform,
+            "language": self.language,
+            "loginsession": self.credentials.login_session,
+            "lid": self.credentials.license_id,
+            "userid": self.credentials.user_id,
+            "timestamp": str(timestamp),
+            "token": self._generate_family_token(plaintext, timestamp),
+            "Host": self.API_HOST,
+        }
 
 
 def load_cached_devices(filepath: str) -> List[DeviceInfo]:
