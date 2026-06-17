@@ -36,14 +36,6 @@ SENSOR_TYPES: list[SensorEntityDescription] = [
         key="error_code",
         name="Error Code",
     ),
-    SensorEntityDescription(
-        key="timer",
-        name="Timer",
-    ),
-    SensorEntityDescription(
-        key="schedule_time",
-        name="Schedule Time",
-    ),
 ]
 
 
@@ -111,10 +103,6 @@ class KelvinatorSensor(SensorEntity):
             return s.ambient_temp if s.ambient_temp > 0 else None
         elif self._key == "error_code":
             return None if s.error_code == 0 else str(s.error_code)
-        elif self._key == "timer":
-            return None
-        elif self._key == "schedule_time":
-            return None
         return None
 
     @callback
