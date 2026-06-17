@@ -13,6 +13,7 @@ import hashlib
 import json as _json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -226,6 +227,132 @@ class DNACloudRelay:
         return _json.loads(result)
 
 
+class DNALocalRelay:
+    """
+    Local UDP control using the pure-Python DNA protocol implementation.
+
+    Falls back to LAN discovery when the native libNetworkAPI.so is unavailable.
+    Each device gets a persistent UDP socket and an asyncio lock for thread safety.
+    """
+
+    def __init__(self) -> None:
+        self._devices: dict[str, "KelvinatorDevice"] = {}
+        self._lock = threading.Lock()
+        self._ip_cache: dict[str, str] = {}  # mac_lower → ip
+
+    # ------------------------------------------------------------------
+    # Public interface (matches DNACloudRelay)
+    # ------------------------------------------------------------------
+
+    def send_command(
+        self,
+        did: str, mac: str, aes_key: str, password: int, command_json: str,
+    ) -> dict:
+        """Send a control command to the device via local UDP."""
+        try:
+            dev = self._get_device(did, mac, aes_key, password)
+            cmd = _json.loads(command_json)
+            params: dict = cmd.get("params", {})
+
+            if "power" in params:
+                dev.set_power(bool(params["power"]))
+            if "mode" in params:
+                dev.set_mode(int(params["mode"]))
+            if "temp" in params:
+                dev.set_temperature(int(params["temp"]))
+            if "fan" in params:
+                dev.set_fan_speed(int(params["fan"]))
+            if "vdir" in params or "hdir" in params:
+                v = int(params.get("vdir", 0))
+                h = int(params.get("hdir", 0))
+                dev.set_swing((1 if v else 0) | (2 if h else 0))
+            if "sleep" in params:
+                dev.set_sleep(bool(params["sleep"]))
+
+            dev.send_control()
+            return {"status": 0}
+        except Exception as exc:
+            _LOGGER.error("Local command failed for %s: %s", mac, exc)
+            return {"status": -1, "message": str(exc)}
+
+    def get_status(self, config_json: str) -> dict:
+        """Query device state via local UDP."""
+        try:
+            config = _json.loads(config_json)
+            did = config["did"]
+            mac = config["mac"]
+            aes_key = config["aes_key"]
+            password = int(config["password"])
+
+            dev = self._get_device(did, mac, aes_key, password)
+            status = dev.get_status()
+
+            return {
+                "status": 0,
+                "data": {
+                    "ac_pwr": 1 if status.power else 0,
+                    "ac_mode": status.mode,
+                    "temp": status.temp,
+                    "ac_mark": status.fan,
+                    "envtemp": status.room_temp or 0,
+                    "ac_errcode": status.error_code,
+                    "ac_vdir": status.swing,
+                    "ac_slp": 1 if status.sleep else 0,
+                },
+            }
+        except Exception as exc:
+            _LOGGER.error("Local status failed: %s", exc)
+            return {"status": -1, "message": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_device(
+        self, did: str, mac: str, aes_key: str, password: int,
+    ) -> "KelvinatorDevice":
+        """Get or create a local KelvinatorDevice for the given MAC/DID."""
+        dev = self._devices.get(did)
+        if dev is not None:
+            return dev
+        with self._lock:
+            if did in self._devices:
+                return self._devices[did]
+            ip = self._discover_ip(mac)
+            if not ip:
+                raise RuntimeError(
+                    f"Cannot find LAN IP for {mac}. "
+                    f"Make sure the AC is on the same network as Home Assistant."
+                )
+            from .kelvinator_dna.device import KelvinatorDevice
+            dev = KelvinatorDevice(
+                ip=ip, did=did, mac=mac, aes_key=aes_key, password=password,
+            )
+            dev.connect()
+            dev.authenticate()
+            self._devices[did] = dev
+            _LOGGER.info("Local device connected: %s @ %s", mac, ip)
+        return self._devices[did]
+
+    def _discover_ip(self, mac: str) -> Optional[str]:
+        """Find the LAN IP for a given MAC address via UDP broadcast."""
+        mac_lower = mac.lower()
+        if mac_lower in self._ip_cache:
+            return self._ip_cache[mac_lower]
+
+        from .kelvinator_dna.device import discover_devices
+        try:
+            devices = discover_devices(timeout=3.0)
+            for d in devices:
+                d_mac = d["mac"].lower()
+                self._ip_cache[d_mac] = d["ip"]
+                _LOGGER.info("LAN discovered: %s @ %s", d_mac, d["ip"])
+        except Exception as exc:
+            _LOGGER.debug("LAN discovery error: %s", exc)
+
+        return self._ip_cache.get(mac_lower)
+
+
 # ---------------------------------------------------------------------------
 # Device wrapper
 # ---------------------------------------------------------------------------
@@ -311,11 +438,12 @@ CloudACDevice = KelvinatorACDevice
 # ---------------------------------------------------------------------------
 
 
-def get_dna_relay() -> Optional[DNACloudRelay]:
-    """Get the DNA cloud relay if the native library is available."""
+def get_dna_relay() -> Optional[DNACloudRelay | DNALocalRelay]:
+    """Get the DNA relay — cloud relay preferred, local UDP as fallback."""
     if _SO_AVAILABLE:
         try:
             return DNACloudRelay()
         except Exception as exc:
-            _LOGGER.warning("Failed to init DNA relay: %s", exc)
-    return None
+            _LOGGER.warning("Failed to init cloud relay: %s", exc)
+    _LOGGER.info("Cloud relay unavailable — using local UDP control")
+    return DNALocalRelay()

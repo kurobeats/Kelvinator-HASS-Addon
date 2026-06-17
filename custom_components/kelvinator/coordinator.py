@@ -53,10 +53,7 @@ class KelvinatorCoordinator(DataUpdateCoordinator[dict[str, KelvinatorACDevice]]
             raise UpdateFailed(f"Cloud login failed: {exc}") from exc
 
         self._relay = get_dna_relay()
-        if self._relay:
-            _LOGGER.info("DNA cloud relay initialized")
-        else:
-            _LOGGER.info("DNA relay not available — state polling disabled")
+        _LOGGER.info("DNA relay initialized (%s)", type(self._relay).__name__)
 
         cloud_devices = await self._cloud.discover_devices()
         _LOGGER.info("Cloud returned %d device(s)", len(cloud_devices))
