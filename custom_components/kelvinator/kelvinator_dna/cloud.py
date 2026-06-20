@@ -1,22 +1,21 @@
 """
 Cloud API: Interface with the BroadLink cloud service for device discovery
-and credential retrieval.
+and credential retrieval for Kelvinator/Electrolux AC units.
 
 The cloud API is a set of HTTPS REST endpoints hosted at:
-  - bizihcv0.ibroadlink.com (main API)
+  - bizihcv0.ibroadlink.com (main API, family/device management)
   - rccode.ibroadlink.com (remote control codes)
 
 Authentication:
   - License ID: 32-char hex string unique per OEM/app installation
   - Login session: obtained via /ec4/v1/common/api
   - User ID: 32-char hex string unique per user account
-  - Token: session token for subsequent requests
+  - Token: MD5-based session token for subsequent requests
 
 API Endpoints:
-  1. GET  /ec4/v1/common/api          → Get API key (initial handshake)
-  2. POST /ec4/v1/user/getfamilyid     → Get family/home IDs for the user
-  3. POST /ec4/v1/family/getallinfo    → Get all devices with AES keys
-  4. POST /data/v1/appdata/upload     → Upload app analytics data
+  1. GET  /ec4/v1/common/api          -> Get API key (initial handshake)
+  2. POST /ec4/v1/user/getfamilyid     -> Get family/home IDs
+  3. POST /ec4/v1/family/getallinfo    -> Get all devices with AES keys
 """
 
 import hashlib
@@ -38,65 +37,61 @@ _LOGGER = logging.getLogger(__name__)
 # AES constants (from decompiled BroadLink SDK)
 # ---------------------------------------------------------------------------
 
-AES_IV = bytes(
-    [0xEA, 0xAA, 0xAA, 0x3A, 0xBB, 0x58, 0x62, 0xA2,
-     0x19, 0x18, 0xB5, 0x77, 0x1D, 0x16, 0x15, 0xAA]
-)
+AES_IV = bytes([
+    0xEA, 0xAA, 0xAA, 0x3A, 0xBB, 0x58, 0x62, 0xA2,
+    0x19, 0x18, 0xB5, 0x77, 0x1D, 0x16, 0x15, 0xAA,
+])
 TOKEN_SALT = "xgx3d*fe3478$ukx"
 
 
+# ---------------------------------------------------------------------------
+# Data Classes
+# ---------------------------------------------------------------------------
+
 @dataclass
 class DeviceInfo:
-    """Information about a discovered AC device."""
-    did: str            # Device ID (34 hex chars = 17 bytes)
-    mac: str            # MAC address (aa:bb:cc:dd:ee:ff)
-    name: str           # User-assigned device name
-    devtype: int        # Device type (e.g., 20379 = AC)
-    pid: str            # Product ID
-    password: int       # Device password (4-byte key for auth)
-    aes_key: str        # AES-128 key (32 hex chars = 16 bytes)
-    terminal_id: int    # Terminal ID
-    sub_device_num: int # Number of sub-devices
-    room_id: str        # Room ID
-    room_name: str = "" # Room name (filled if available)
-
-
-@dataclass
-class FamilyInfo:
-    """Information about a home/family."""
-    family_id: str      # Family ID (hex)
-    family_name: str    # Family name
-    rooms: List[Dict] = field(default_factory=list)
-    modules: List[Dict] = field(default_factory=list)
+    """Information about a discovered AC device from the cloud API."""
+    did: str                    # Device ID (34 hex chars = 17 bytes)
+    mac: str                    # MAC address (colon-separated hex)
+    name: str                   # User-assigned device name
+    devtype: int                # Device type (e.g., 20379 = AC)
+    pid: str                    # Product ID
+    password: int               # Device password (4-byte key for auth XOR)
+    aes_key: str                # AES-128 key (32 hex chars = 16 bytes)
+    terminal_id: int            # Terminal ID
+    sub_device_num: int         # Number of sub-devices
+    room_id: str                # Room ID
+    room_name: str = ""         # Room name
 
 
 @dataclass
 class CloudCredentials:
     """Credentials for accessing the BroadLink cloud API."""
-    license_id: str     # 32-char hex OEM license ID
-    user_id: str        # 32-char hex user ID
-    login_session: str  # 32-char hex session token
-    api_key: str = ""   # API key from initial handshake
-    token: str = ""     # Auth token for subsequent requests
-    server_timestamp: int = 0  # Timestamp from /ec4/v1/common/api response
+    license_id: str             # 32-char hex OEM license ID
+    user_id: str                # 32-char hex user ID
+    login_session: str          # 32-char hex login session
+    api_key: str = ""           # API key from /ec4/v1/common/api
+    token: str = ""             # Auth token for subsequent requests
+    server_timestamp: int = 0   # Timestamp from /ec4/v1/common/api
 
+
+# ---------------------------------------------------------------------------
+# KelvinatorCloud Client
+# ---------------------------------------------------------------------------
 
 class KelvinatorCloud:
     """
-    Client for the BroadLink cloud API.
+    Client for the BroadLink cloud API specific to Kelvinator/Electrolux AC.
 
     Usage:
         cloud = KelvinatorCloud(license_id="bddb...")
         cloud.authenticate()
-        devices = cloud.get_devices()
+        devices = cloud.discover_devices()
         for dev in devices:
             print(f"{dev.name}: {dev.mac}, AES key: {dev.aes_key}")
     """
 
     API_HOST = "bddb4af53f74edaa03b1aa439b75e7a6bizihcv0.ibroadlink.com"
-    RCCODE_HOST = "bddb4af53f74edaa03b1aa439b75e7a6rccode.ibroadlink.com"
-    BASE_URL = f"https://{API_HOST}"
-    RCCODE_URL = f"https://{RCCODE_HOST}"
 
     def __init__(
         self,
@@ -107,15 +102,6 @@ class KelvinatorCloud:
         app_platform: str = "android",
         language: str = "en-au",
     ):
-        """
-        Args:
-            license_id: OEM license ID (32 hex chars)
-            user_id: User account ID (32 hex chars, can be set later)
-            login_session: Session ID (can be set after authentication)
-            system: System identifier (default: "android")
-            app_platform: Platform identifier (default: "android")
-            language: Language code (default: "en-au")
-        """
         self.credentials = CloudCredentials(
             license_id=license_id,
             user_id=user_id,
@@ -127,30 +113,22 @@ class KelvinatorCloud:
         self._family_id: str = ""
         self._server_key: bytes = b""
         self.user_agent = (
-            f"Dalvik/2.1.0 (Linux; U; Android 16; SM-S926B Build/BP4A.251205.006)"
+            "Dalvik/2.1.0 (Linux; U; Android 16; SM-S926B Build/BP4A.251205.006)"
         )
+
+    # ------------------------------------------------------------------
+    # HTTP helpers
+    # ------------------------------------------------------------------
 
     def _make_request(
         self,
         method: str,
         path: str,
         body: Optional[bytes] = None,
-        host: str = None,
-        extra_headers: Dict[str, str] = None,
+        host: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """
-        Make an HTTPS request to the BroadLink cloud API.
-
-        Args:
-            method: HTTP method (GET, POST)
-            path: API path (e.g., /ec4/v1/common/api)
-            body: Raw request body bytes
-            host: Override API host
-            extra_headers: Additional HTTP headers
-
-        Returns:
-            Parsed JSON response
-        """
+        """Make an HTTPS request to the BroadLink cloud API."""
         url = f"https://{host or self.API_HOST}{path}"
 
         headers = {
@@ -165,7 +143,6 @@ class KelvinatorCloud:
 
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
 
-        # Allow self-signed / custom CA (for MITM analysis)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -179,18 +156,18 @@ class KelvinatorCloud:
             body_text = e.read().decode('utf-8', errors='replace')
             raise RuntimeError(f"HTTP {e.code}: {body_text}")
 
+    # ------------------------------------------------------------------
+    # Authentication
+    # ------------------------------------------------------------------
+
     def authenticate(self) -> str:
         """
         Perform cloud authentication.
 
-        1. Get API key and server timestamp from /ec4/v1/common/api
-
-        Returns:
-            API key string
+        Step 1: Get API key and server timestamp from /ec4/v1/common/api
         """
         timestamp = int(time.time())
 
-        # Step 1: Get API key and server timestamp
         headers = {
             "system": self.system,
             "appPlatform": self.app_platform,
@@ -201,20 +178,16 @@ class KelvinatorCloud:
         resp = self._make_request("GET", "/ec4/v1/common/api", extra_headers=headers)
         self.credentials.api_key = resp.get("key", "")
         self.credentials.server_timestamp = resp.get("timestamp", timestamp)
-        self._server_key = b""  # reset so _encrypt_family_body picks up new key
-        _LOGGER.info("Family API key obtained (server_ts=%d)", self.credentials.server_timestamp)
+        self._server_key = b""
+        _LOGGER.info("API key obtained (server_ts=%d)", self.credentials.server_timestamp)
         return self.credentials.api_key
 
+    # ------------------------------------------------------------------
+    # Family / Home
+    # ------------------------------------------------------------------
+
     def get_family_id(self) -> str:
-        """
-        Get the family (home) ID for the user.
-
-        Requires: login_session, user_id, license_id to be set.
-        Requires: authenticate() to have been called first.
-
-        Returns:
-            Family ID string
-        """
+        """Get the family (home) ID for the user."""
         timestamp = self.credentials.server_timestamp or int(time.time())
 
         body_json = json.dumps(
@@ -230,22 +203,22 @@ class KelvinatorCloud:
 
         family_info = resp.get("familyinfo", [])
         if family_info:
-            _LOGGER.info("Family ID: %s", family_info[0].get("id"))
-            return family_info[0].get("id", "")
+            fid = family_info[0].get("id", "")
+            _LOGGER.info("Family ID: %s", fid)
+            self._family_id = fid
+            return fid
+
         _LOGGER.warning("No family info in response: %s", resp)
         return ""
 
+    # ------------------------------------------------------------------
+    # Device discovery
+    # ------------------------------------------------------------------
+
     def get_all_devices(self) -> Dict[str, Any]:
-        """
-        Get all device information including AES keys.
-
-        Automatically discovers the family ID if not cached.
-
-        Returns:
-            Full API response with family, rooms, devices, and modules
-        """
+        """Get all device information including AES keys from the cloud."""
         if not self._family_id:
-            self._family_id = self.get_family_id()
+            self.get_family_id()
         if not self._family_id:
             _LOGGER.error("Cannot get devices: no family ID")
             return {}
@@ -265,24 +238,19 @@ class KelvinatorCloud:
         )
 
     def discover_devices(self) -> List[DeviceInfo]:
-        """
-        Discover all AC devices linked to the account.
-
-        Returns:
-            List of DeviceInfo objects with AES keys and credentials
-        """
+        """Discover all AC devices linked to the user account."""
         data = self.get_all_devices()
-        devices = []
+        if not data:
+            return []
 
+        devices: List[DeviceInfo] = []
         family_data = data.get("familyallinfo", [{}])[0]
 
-        # Build room lookup
-        rooms = {}
+        rooms: Dict[str, str] = {}
         for room in family_data.get("roominfo", []):
             rooms[room.get("roomid", "")] = room.get("name", "")
 
-        # Build module lookup (maps modules to DIDs)
-        module_dids = {}
+        module_dids: Dict[str, str] = {}
         for mod in family_data.get("moduleinfo", []):
             for mdev in mod.get("moduledev", []):
                 module_dids[mdev.get("did", "")] = mod.get("name", "")
@@ -304,19 +272,16 @@ class KelvinatorCloud:
             )
             devices.append(device)
 
+        _LOGGER.info("Discovered %d device(s) in cloud account", len(devices))
         return devices
 
-    # -----------------------------------------------------------------------
-    # Family API helpers (AES encryption + token generation)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Encryption helpers (Family API)
+    # ------------------------------------------------------------------
 
     def _encrypt_family_body(self, plaintext: str) -> bytes:
         """
         AES-CBC encrypt the JSON body using the server key from /ec4/v1/common/api.
-
-        Key = raw bytes of server key hex string
-        IV = hardcoded BroadLink IV
-        Padding = PKCS7 (via pycryptodome pad)
         """
         if not self._server_key:
             self._server_key = bytes.fromhex(self.credentials.api_key)
@@ -324,19 +289,14 @@ class KelvinatorCloud:
         return cipher.encrypt(pad(plaintext.encode(), AES.block_size))
 
     def _generate_family_token(self, plaintext: str, timestamp: int) -> str:
-        """
-        Generate token for Family API endpoints.
-
-        Formula (from decompiled BroadLink SDK class j.java):
-            MD5(plaintext_json + TOKEN_SALT + timestamp + userid)
-        """
+        """Generate MD5 token for Family API endpoints."""
         material = (
             plaintext + TOKEN_SALT + str(timestamp) + self.credentials.user_id
         )
         return hashlib.md5(material.encode()).hexdigest()
 
     def _build_family_headers(self, plaintext: str, timestamp: int) -> Dict[str, str]:
-        """Build common headers for Family API (/ec4/v1/) POST requests."""
+        """Build common headers for Family API POST requests."""
         return {
             "Content-type": "application/x-java-serialized-object",
             "system": self.system,
@@ -351,19 +311,12 @@ class KelvinatorCloud:
         }
 
 
+# ---------------------------------------------------------------------------
+# Device cache helpers
+# ---------------------------------------------------------------------------
+
 def load_cached_devices(filepath: str) -> List[DeviceInfo]:
-    """
-    Load cached device information from a JSON file.
-
-    This is useful when you've already retrieved credentials via the app
-    or MITM proxy and want to control devices offline.
-
-    Args:
-        filepath: Path to JSON file
-
-    Returns:
-        List of DeviceInfo objects
-    """
+    """Load cached device information from a JSON file."""
     with open(filepath, 'r') as f:
         data = json.load(f)
 
@@ -385,7 +338,7 @@ def load_cached_devices(filepath: str) -> List[DeviceInfo]:
     return devices
 
 
-def save_cached_devices(devices: List[DeviceInfo], filepath: str):
+def save_cached_devices(devices: List[DeviceInfo], filepath: str) -> None:
     """Save device credentials to a JSON file."""
     data = {
         "devices": [
