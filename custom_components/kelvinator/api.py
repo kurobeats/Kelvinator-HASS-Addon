@@ -232,283 +232,49 @@ class DNACloudRelay:
 
 class DNALocalRelay:
     """
-    Local UDP control using python-broadlink for transport.
+    Local UDP control fallback when libNetworkAPI.so is not available.
 
-    Uses the standard BroadLink DNA protocol (hello → auth → send_packet)
-    which Electrolux/Kelvinator ACs (devtype 0x4F9B/20379) speak natively.
+    The Kelvinator/Electrolux AC wire protocol is proprietary and requires
+    the libNetworkAPI.so native library for reliable communication.
+    Without it, local UDP control is not supported.
 
-    After authentication the transport AES key is replaced with the
-    per-device cloud key (matching the official app behaviour).
-
-    Commands are serialised as TFB (Type-Field-Body) binary payloads
-    — the native wire format that the AC firmware understands.
-    The device does NOT speak JSON over the wire.
+    This class exists solely to provide a graceful degradation path:
+    it logs a clear warning once and returns failure responses so the
+    integration marks the device as unavailable instead of spamming
+    error logs every poll cycle.
     """
 
-    # Devtype for Electrolux / Kelvinator AC units
-    AC_DEVTYPE = 0x4F9B  # 20379
-
-    # Map HA-level param names → TFB payload-param names
-    _HA_PARAM_TO_TFB = {
-        "power": "power",
-        "mode": "mode",
-        "temp": "temp",
-        "fan": "fan",
-        "vdir": "swing",
-        "hdir": "swing",
-        "sleep": "sleep",
-        "turbo": "turbo",
-        "screen_display": "screen_display",
-    }
-
-    # Map TFB response-param names → app-level JSON key names
-    _TFB_TO_APP = {
-        "power": "ac_pwr",
-        "mode": "ac_mode",
-        "temp": "temp",
-        "fan": "ac_mark",
-        "room_temp": "envtemp",
-        "error_code": "ac_errcode",
-        "swing": "ac_vdir",
-        "sleep": "ac_slp",
-    }
-
     def __init__(self) -> None:
-        self._devices: dict[str, "_BroadlinkDevice"] = {}
-        self._lock = threading.Lock()
+        self._warned: bool = False
 
     # ------------------------------------------------------------------
-    # Public interface (matches DNACloudRelay)
+    # Public interface (matches DNACloudRelay plus DNALocalRelay)
     # ------------------------------------------------------------------
 
     def send_command(
         self,
         did: str, mac: str, aes_key: str, password: int, command_json: str,
     ) -> dict:
-        """Send a control command to the device via local UDP.
-
-        command_json is a JSON string ``{"did": ..., "params": {...}}``
-        where ``params`` keys are HA-level names (power, mode, temp, fan,
-        vdir, hdir, sleep, turbo, screen_display).
-        """
-        try:
-            dev = self._get_device(did, mac, aes_key)
-            cmd = _json.loads(command_json)
-            ha_params: dict = cmd.get("params", {})
-
-            if not ha_params:
-                return {"status": 0}
-
-            # Build TFB params dict from HA params
-            tfb_params: dict[str, Any] = {
-                "did": dev.did,
-                "sub_device_id": 0,
-                "command_type": 0x01,
-            }
-            for ha_name, val in ha_params.items():
-                tfb_name = self._HA_PARAM_TO_TFB.get(ha_name)
-                if tfb_name is None:
-                    _LOGGER.warning("Unknown param %s, skipping", ha_name)
-                    continue
-                # Combine vdir/hdir into the swing bitmask
-                if ha_name == "vdir":
-                    tfb_params["swing"] = (
-                        tfb_params.get("swing", 0) & 0b10
-                    ) | (int(val) & 0b01)
-                elif ha_name == "hdir":
-                    tfb_params["swing"] = (
-                        tfb_params.get("swing", 0) & 0b01
-                    ) | ((int(val) & 0b01) << 1)
-                else:
-                    tfb_params[tfb_name] = val
-
-            # Import protocol functions here to avoid circular imports
-            from .kelvinator_dna.protocol import build_control_payload
-
-            payload = build_control_payload(tfb_params)
-            self._send_and_recv(dev, 0x6A, payload)
-            return {"status": 0}
-        except Exception as exc:
-            _LOGGER.error("Local command failed for %s: %s", mac, exc)
-            return {"status": -1, "message": str(exc)}
+        """Return a failure — local UDP control is unavailable."""
+        if not self._warned:
+            self._warned = True
+            _LOGGER.warning(
+                "Local UDP control requires libNetworkAPI.so which was not found. "
+                "Install the library or use a different integration setup. "
+                "Commands will not reach the device."
+            )
+        return {"status": -1, "message": "Local UDP control unavailable; install libNetworkAPI.so"}
 
     def get_status(self, config_json: str) -> dict:
-        """Query device state via local UDP.
-
-        Returns JSON matching the DNACloudRelay response format
-        (app-level field names like ac_pwr, ac_mode, etc.).
-        """
-        try:
-            config = _json.loads(config_json)
-            did = config["did"]
-            mac = config["mac"]
-            aes_key = config["aes_key"]
-
-            dev = self._get_device(did, mac, aes_key)
-
-            from .kelvinator_dna.protocol import (
-                build_control_payload,
-                parse_status_payload,
+        """Return a failure — device status unavailable locally."""
+        if not self._warned:
+            self._warned = True
+            _LOGGER.warning(
+                "Local UDP control requires libNetworkAPI.so which was not found. "
+                "Install the library or use a different integration setup. "
+                "Device status unavailable."
             )
-
-            # Build TFB query payload (command_type=0x02 = status query)
-            tfb_params = {
-                "did": dev.did,
-                "sub_device_id": 0,
-                "command_type": 0x02,
-            }
-            query = build_control_payload(tfb_params)
-            resp = self._send_and_recv(dev, 0x6A, query)
-
-            # Parse the TFB response
-            parsed = parse_status_payload(resp)
-
-            # Build app-level JSON response
-            data = {}
-            for tfb_key, app_key in self._TFB_TO_APP.items():
-                if tfb_key in parsed:
-                    val = parsed[tfb_key]
-                    if tfb_key == "temp":
-                        val = int(float(val))
-                    elif tfb_key == "room_temp":
-                        val = float(val)
-                    data[app_key] = val
-
-            # Decode swing (combined bitmask) into separate vdir / hdir
-            if "swing" in parsed:
-                swing_val = int(parsed["swing"])
-                data["ac_vdir"] = swing_val & 1
-                data["ac_hdir"] = (swing_val >> 1) & 1
-
-            # Provide defaults for any missing fields
-            data.setdefault("ac_pwr", 0)
-            data.setdefault("ac_mode", 0)
-            data.setdefault("temp", 24)
-            data.setdefault("ac_mark", 0)
-            data.setdefault("envtemp", 0.0)
-            data.setdefault("ac_errcode", 0)
-            data.setdefault("ac_vdir", 0)
-            data.setdefault("ac_slp", 0)
-            data.setdefault("ac_hdir", 0)
-
-            return {"status": 0, "data": data}
-        except Exception as exc:
-            _LOGGER.error("Local status failed: %s", exc)
-            return {"status": -1, "message": str(exc)}
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _send_and_recv(self, dev: "_BroadlinkDevice", cmd_byte: int, tfb_payload: bytes) -> bytes:
-        """
-        Send a raw TFB payload and return the decrypted TFB response body.
-
-        The payload goes through three layers:
-          1. send_packet(0x6A, tfb_payload) — zero-pads and encrypts with
-             the cloud key (installed in :meth:`connect`).
-          2. The device decrypts with its cloud key, processes the TFB
-             command, and returns a TFB response.
-          3. We decrypt the response and strip zero-padding.
-
-        There is NO UTF-8 decode — the TFB payload is pure binary.
-        """
-        import broadlink
-
-        resp = dev.broadlink.send_packet(cmd_byte, tfb_payload)
-        broadlink.exceptions.check_error(resp[0x22:0x24])
-
-        # Decrypt response payload (still encrypted by send_packet)
-        decrypted = dev.broadlink.decrypt(resp[0x38:])
-        # Strip zero-padding (device uses NUL bytes, not PKCS7)
-        return decrypted.rstrip(b"\x00")
-
-    def _get_device(
-        self, did: str, mac: str, aes_key: str,
-    ) -> "_BroadlinkDevice":
-        """Get or create a BroadLink device wrapper for the given MAC/DID."""
-        dev = self._devices.get(did)
-        if dev is not None:
-            return dev
-        with self._lock:
-            if did in self._devices:
-                return self._devices[did]
-            ip = self._discover_ip(mac)
-            if not ip:
-                raise RuntimeError(
-                    f"Cannot find LAN IP for {mac}. "
-                    f"Make sure the AC is on the same network as Home Assistant."
-                )
-            dev = _BroadlinkDevice(
-                ip=ip, mac=mac, aes_key=aes_key, devtype=self.AC_DEVTYPE,
-                did=did,
-            )
-            dev.connect()
-            self._devices[did] = dev
-            _LOGGER.info("Local device connected: %s @ %s", mac, ip)
-        return self._devices[did]
-
-    def _discover_ip(self, mac: str) -> Optional[str]:
-        """Find the LAN IP for a given MAC address."""
-        import broadlink
-
-        mac_lower = mac.lower()
-
-        # Try direct hello (the device IS on the same subnet)
-        for ip_suffix in range(150, 160):
-            ip = f"192.168.1.{ip_suffix}"
-            try:
-                dev = broadlink.hello(ip, port=80, timeout=2)
-                if dev.mac.hex().lower() == mac_lower:
-                    _LOGGER.info("Discovered: %s @ %s", mac, ip)
-                    return ip
-            except Exception:
-                pass
-
-        # Fall back to ARP
-        try:
-            with open("/proc/net/arp") as f:
-                for line in f.readlines()[1:]:
-                    parts = line.split()
-                    if len(parts) >= 4 and parts[3].lower() == mac_lower:
-                        return parts[0]
-        except Exception:
-            pass
-        return None
-
-
-class _BroadlinkDevice:
-    """Thin wrapper around a python-broadlink Device with cloud-key encryption.
-
-    After the standard BroadLink auth handshake the transport AES key is
-    replaced with the per-device cloud key.  This is what the official
-    Electrolux app does — it authenticates to obtain the device_id / MAC
-    for the header, then overwrites the session key with the cloud key
-    from the server.
-    """
-
-    def __init__(
-        self, ip: str, mac: str, aes_key: str, devtype: int, did: str = "",
-    ) -> None:
-        self.ip = ip
-        self.mac = mac
-        self.did = did  # 32-char hex DID, used in TFB payload building
-        self._devtype = devtype
-        self._aes_key = aes_key
-        self.broadlink = None
-
-    def connect(self) -> None:
-        """Discover and authenticate with the device."""
-        import broadlink
-
-        self.broadlink = broadlink.hello(self.ip, port=80, timeout=5)
-        self.broadlink.auth()
-        _LOGGER.info("BroadLink auth OK for %s (id=%s)", self.ip, self.broadlink.id)
-
-        # Replace the transport AES key with the per-device cloud key.
-        # The official app does the same: auth → overwrite key → send commands.
-        self.broadlink.update_aes(bytes.fromhex(self._aes_key))
-        _LOGGER.debug("Transport key replaced with cloud key for %s", self.mac)
+        return {"status": -1, "message": "Local UDP control unavailable; install libNetworkAPI.so"}
 
 
 # ---------------------------------------------------------------------------
