@@ -3,11 +3,14 @@ Broadlink Device Module
 =========================
 High-level representation of a Broadlink smart home device.
 
-Provides discovery, authentication, and control operations matching
-the API surface of the original libNetworkAPI.so JNI library.
+Provides discovery, authentication, and control operations using
+the Broadlink DNA protocol (matching python-broadlink library format).
+
+For Kelvinator/Electrolux ACs (devtype 0x4F9B), the transport AES key
+is replaced with the per-device cloud key after authentication, matching
+what the official app does.
 """
 
-import json
 import struct
 import socket
 import time
@@ -18,11 +21,10 @@ from .protocol import (
     parse_device_response,
     build_discovery_packet,
     parse_discovery_response,
+    AES_IV,
     CMD_AUTH,
-    CMD_LOGIN,
     CMD_DEVICE_CONTROL,
     CMD_DEVICE_STATUS,
-    CMD_DISCOVERY,
 )
 from .crypto import AESCipher, broadlink_decrypt, derive_device_key
 
@@ -55,9 +57,9 @@ class BroadlinkDevice:
         Args:
             host: IP address of the device
             mac: 6-byte MAC address
-            device_type: Device type identifier
-            device_id: Device ID (can be 0; obtained during auth)
-            key: 16-byte AES key (default is the Broadlink default key)
+            device_type: Device type identifier (e.g. 0x4F9B for Kelvinator AC)
+            device_id: Device ID (0 = obtained during auth)
+            key: 16-byte AES key (the per-device cloud key for Kelvinator)
             timeout: Socket timeout in seconds
         """
         self.host = host
@@ -66,7 +68,6 @@ class BroadlinkDevice:
         self.device_id = device_id
         self.key = key if key else self._default_key()
         self.timeout = timeout
-        self.iv = None
         self._count = 0
         self._authenticated = False
         self._sock = None
@@ -80,15 +81,16 @@ class BroadlinkDevice:
         ])
 
     def _get_count(self) -> int:
-        """Get and increment the packet sequence counter."""
-        self._count = (self._count + 1) & 0xFFFF
+        """Get and increment the packet sequence counter (bit 15 set)."""
+        self._count = ((self._count + 1) | 0x8000) & 0xFFFF
         return self._count
 
     def _send_packet(self, command: int, payload: bytes) -> bytes:
         """
-        Send a command packet and receive the response.
+        Send a command packet and receive the raw response.
 
-        Returns the raw response bytes.
+        The response is returned RAW (NOT decrypted).  The caller must
+        decrypt the payload at data[0x38:] using the device key.
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(self.timeout)
@@ -102,7 +104,6 @@ class BroadlinkDevice:
                 command=command,
                 payload=payload,
                 count=self._get_count(),
-                iv=self.iv,
             )
             sock.sendto(pkt, (self.host, DEVICE_PORT))
             data, addr = sock.recvfrom(4096)
@@ -114,72 +115,53 @@ class BroadlinkDevice:
         """
         Authenticate with the device.
 
-        The Broadlink auth handshake:
-        1. Send an empty auth command (0x65)
-        2. Receive an encrypted response with the device ID and key
-        3. Derive the IV from device ID + key
+        The Broadlink auth handshake (matching python-broadlink):
+        1. Send auth command (0x65) with magic payload
+        2. Receive response with device ID and session key
+        3. Update AES key with the session key
+
+        For Kelvinator ACs, the caller should then overwrite the key
+        with the per-device cloud key via update_key().
 
         Returns:
             True if authentication succeeded.
         """
-        # Step 1: Send auth request
-        response = self._send_packet(CMD_AUTH, b'\x00' * 80)
+        # Build auth payload (matches python-broadlink's auth())
+        packet = bytearray(0x50)
+        packet[0x04:0x14] = bytes([0x31] * 16)
+        packet[0x1E] = 0x01
+        packet[0x2D] = 0x01
+        packet[0x30:0x36] = b"Test 1"
+
+        response = self._send_packet(CMD_AUTH, packet)
 
         if len(response) < 0x38:
             return False
 
-        # Extract device ID from response header
-        dev_id = struct.unpack_from("<I", response, 0x0C)[0]
-        self.device_id = dev_id
+        # Decrypt response payload with current (default) key
+        decrypted = broadlink_decrypt(response[0x38:], self.key, AES_IV)
 
-        # Derive IV
-        self.iv = derive_device_key(self.device_id, self.key)
+        # Extract device ID (first 4 bytes) and session key (next 16 bytes)
+        self.device_id = int.from_bytes(decrypted[:0x4], "little")
+        session_key = decrypted[0x04:0x14]
+
+        # Update AES key to the session key
+        self.key = session_key
         self._authenticated = True
         return True
 
-    def get_device_info(self) -> Dict[str, Any]:
-        """
-        Get device information (name, type, firmware version, etc.).
-
-        Corresponds to `networkapi_device_profile` in the native library.
-        """
-        if not self._authenticated:
-            self.auth()
-
-        payload = struct.pack("<I", 1)  # Request sub-command 1 for info
-        response = self._send_packet(CMD_DEVICE_STATUS, payload)
-
-        result = parse_device_response(response, self.key, self.device_id, self.iv)
-        return self._parse_device_info(result["payload"])
-
-    def _parse_device_info(self, payload: bytes) -> Dict[str, Any]:
-        """Parse the device info from the raw payload."""
-        info = {
-            "device_id": self.device_id,
-            "device_type": hex(self.device_type),
-        }
-        try:
-            # Device name is at offset 0x40, typically null-terminated ASCII
-            null_idx = payload.find(b'\x00', 0x40)
-            if null_idx > 0x40:
-                info["name"] = payload[0x40:null_idx].decode("utf-8", errors="replace")
-
-            # MAC at some offset
-            info["mac"] = ":".join(f"{b:02x}" for b in self.mac[:6])
-
-            # Firmware info may be embedded
-        except Exception:
-            pass
-        return info
+    def update_key(self, new_key: bytes) -> None:
+        """Replace the device AES key (e.g. with the per-device cloud key)."""
+        if len(new_key) != 16:
+            raise ValueError(f"Key must be 16 bytes, got {len(new_key)}")
+        self.key = new_key
 
     def send_command(self, command_data: bytes) -> Dict[str, Any]:
         """
-        Send an arbitrary device control command.
-
-        Corresponds to `networkapi_dna_control` / `network_device_remote_control`.
+        Send an arbitrary device control command (0x6A).
 
         Args:
-            command_data: Raw command payload (device-specific)
+            command_data: Raw unencrypted command payload
 
         Returns:
             Parsed response dictionary with 'payload' key.
@@ -188,30 +170,20 @@ class BroadlinkDevice:
             self.auth()
 
         response = self._send_packet(CMD_DEVICE_CONTROL, command_data)
-        return parse_device_response(response, self.key, self.device_id, self.iv)
-
-    def set_power(self, state: bool) -> Dict[str, Any]:
-        """
-        Turn the device on or off (for SP series plugs, MP1, etc.).
-
-        Args:
-            state: True for ON, False for OFF
-        """
-        payload = struct.pack("<I", 1 if state else 0)
-        return self.send_command(payload)
+        return parse_device_response(response, self.key)
 
     def get_status(self) -> Dict[str, Any]:
         """
-        Get the current device status.
+        Query device status (0x6B).
 
-        Corresponds to `networkapi_device_devicestatus` / `deviceStatusOnServer`.
+        Returns:
+            Parsed response dictionary with 'payload' key.
         """
         if not self._authenticated:
             self.auth()
 
-        payload = struct.pack("<I", 2)  # Status sub-command
-        response = self._send_packet(CMD_DEVICE_STATUS, payload)
-        return parse_device_response(response, self.key, self.device_id, self.iv)
+        response = self._send_packet(CMD_DEVICE_STATUS, b'\x00')
+        return parse_device_response(response, self.key)
 
     @classmethod
     def discover(
@@ -224,15 +196,6 @@ class BroadlinkDevice:
         Discover Broadlink devices on the local network.
 
         Sends a broadcast discovery packet and collects responses.
-
-        Corresponds to `networkapi_device_probe` in the native library.
-
-        Args:
-            timeout: How long to wait for responses (seconds)
-            local_ip: Local IP to use in the discovery packet
-
-        Returns:
-            List of discovered BroadlinkDevice instances.
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -257,14 +220,13 @@ class BroadlinkDevice:
                     continue
 
                 dev = cls(
-                    host=info["ip"],
+                    host=addr[0],
                     mac=info["mac"],
                     device_type=info["device_type"],
-                    device_id=info["device_id"],
                     key=key,
                     timeout=timeout,
                 )
-                devices[info["device_id"]] = dev
+                devices[info["mac"].hex()] = dev
         finally:
             sock.close()
 

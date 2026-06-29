@@ -234,15 +234,16 @@ class DNALocalRelay:
     """
     Local UDP control using python-broadlink for transport.
 
-    Uses the standard BroadLink protocol (hello → auth → send_packet(0x6A, …))
-    which these Electrolux/Kelvinator ACs (devtype 0x4F9B/20379) speak natively.
+    Uses the standard BroadLink DNA protocol (hello → auth → send_packet)
+    which Electrolux/Kelvinator ACs (devtype 0x4F9B/20379) speak natively.
 
-    AC commands are serialised as JSON mimicking the Java BLStdControlParam
-    structure that the official Electrolux app passes to dnaControl():
+    After authentication the transport AES key is replaced with the
+    per-device cloud key so that payload encryption matches what the
+    official app sends (AES-128-CBC + zero-padding).
+
+    Payloads are serialised in the Java BLStdControlParam JSON format
+    that libNetworkAPI.so passes to the BroadLink firmware:
       {"act": "get|set", "params": ["ac_pwr", …], "vals": [[…], …]}
-
-    The payload is AES-128-CBC encrypted with the per-device cloud key
-    (same key retrieved from the BroadLink cloud API).
     """
 
     # Devtype for Electrolux / Kelvinator AC units
@@ -283,7 +284,7 @@ class DNALocalRelay:
                 "vals": vals,
             }, separators=(",", ":"))
 
-            self._send_encrypted(dev, pkt)
+            self._send_json(dev, pkt)
             return {"status": 0}
         except Exception as exc:
             _LOGGER.error("Local command failed for %s: %s", mac, exc)
@@ -300,7 +301,7 @@ class DNALocalRelay:
             dev = self._get_device(did, mac, aes_key)
 
             pkt = _json.dumps({"act": "get"}, separators=(",", ":"))
-            resp = self._send_encrypted(dev, pkt)
+            resp = self._send_json(dev, pkt)
 
             result = _json.loads(resp)
             if result.get("status") != 0:
@@ -330,25 +331,26 @@ class DNALocalRelay:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _send_encrypted(self, dev: "_BroadlinkDevice", plaintext: str) -> str:
-        """Encrypt JSON, send via 0x6A, decrypt response."""
+    def _send_json(self, dev: "_BroadlinkDevice", plaintext: str) -> str:
+        """Send JSON payload to the device and return decrypted JSON response.
+
+        The payload is zero-padded, then encrypted with the cloud key.
+        python-broadlink's send_packet() handles the transport encryption
+        (its own AES-CBC layer with the key we set via update_aes).
+
+        We do NOT double-encrypt: send_packet() is responsible for the
+        single encryption layer, using the cloud key we installed after auth.
+        """
         import broadlink
 
         payload = plaintext.encode("utf-8")
-        # Pad to 16-byte boundary with PKCS#7
-        pad_len = 16 - (len(payload) % 16)
-        payload += bytes([pad_len] * pad_len)
-
-        encrypted = dev._encrypt(payload)
-        resp = dev.broadlink.send_packet(0x6A, encrypted)
+        resp = dev.broadlink.send_packet(0x6A, payload)
         broadlink.exceptions.check_error(resp[0x22:0x24])
 
-        decrypted = dev._decrypt(resp[0x38:])
-        # Remove PKCS#7 padding
-        if decrypted:
-            pad_len = decrypted[-1]
-            if 1 <= pad_len <= 16:
-                decrypted = decrypted[:-pad_len]
+        # send_packet returns RAW bytes; decrypt the response payload
+        decrypted = dev.broadlink.decrypt(resp[0x38:])
+        # Strip zero-padding (the device zero-pads responses)
+        decrypted = decrypted.rstrip(b"\x00")
         return decrypted.decode("utf-8")
 
     def _get_device(
@@ -405,24 +407,21 @@ class DNALocalRelay:
 
 
 class _BroadlinkDevice:
-    """Thin wrapper around a python-broadlink Device with cloud-key encryption."""
+    """Thin wrapper around a python-broadlink Device with cloud-key encryption.
 
-    # Hardcoded AES IV (same for ALL BroadLink devices)
-    _IV = bytes.fromhex("562e17996d093d28ddb3ba695a2e6f58")
+    After the standard BroadLink auth handshake the transport AES key is
+    replaced with the per-device cloud key.  This is what the official
+    Electrolux app does — it authenticates to obtain the device_id / MAC
+    for the header, then overwrites the session key with the cloud key
+    from the server.
+    """
 
     def __init__(self, ip: str, mac: str, aes_key: str, devtype: int) -> None:
         self.ip = ip
         self.mac = mac
         self._devtype = devtype
+        self._aes_key = aes_key
         self.broadlink = None
-
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        from cryptography.hazmat.backends import default_backend
-        self._aes_key = bytes.fromhex(aes_key)
-        self._Cipher = Cipher
-        self._algorithms = algorithms
-        self._modes = modes
-        self._default_backend = default_backend
 
     def connect(self) -> None:
         """Discover and authenticate with the device."""
@@ -432,25 +431,10 @@ class _BroadlinkDevice:
         self.broadlink.auth()
         _LOGGER.info("BroadLink auth OK for %s (id=%s)", self.ip, self.broadlink.id)
 
-    def _encrypt(self, data: bytes) -> bytes:
-        """AES-128-CBC encrypt with the cloud key."""
-        cipher = self._Cipher(
-            self._algorithms.AES(self._aes_key),
-            self._modes.CBC(self._IV),
-            backend=self._default_backend(),
-        )
-        encryptor = cipher.encryptor()
-        return encryptor.update(data) + encryptor.finalize()
-
-    def _decrypt(self, data: bytes) -> bytes:
-        """AES-128-CBC decrypt with the cloud key."""
-        cipher = self._Cipher(
-            self._algorithms.AES(self._aes_key),
-            self._modes.CBC(self._IV),
-            backend=self._default_backend(),
-        )
-        decryptor = cipher.decryptor()
-        return decryptor.update(data) + decryptor.finalize()
+        # Replace the transport AES key with the per-device cloud key.
+        # The official app does the same: auth → overwrite key → send commands.
+        self.broadlink.update_aes(bytes.fromhex(self._aes_key))
+        _LOGGER.debug("Transport key replaced with cloud key for %s", self.mac)
 
 
 # ---------------------------------------------------------------------------

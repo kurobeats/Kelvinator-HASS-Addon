@@ -1,10 +1,11 @@
 """
 Broadlink DNA Protocol (reverse-engineered from libNetworkAPI.so).
 
-This is a subset of the full broadlink_api library, providing:
-  - device.py  — BroadlinkDevice (UDP transport, auth, command send)
-  - crypto.py  — AES-128-CBC encryption with checksum
-  - protocol.py — 0x38-byte header construction, discovery
+Provides the corrected BroadLink DNA protocol implementation matching
+python-broadlink library format:
+  - device.py     — BroadlinkDevice (UDP transport, auth, command send)
+  - crypto.py     — AES-128-CBC with zero-padding (no checksum prepended)
+  - protocol.py   — 0x38-byte header with magic bytes, checksums at 0x20/0x34
 """
 
 from .device import BroadlinkDevice
@@ -14,6 +15,7 @@ from .protocol import (
     parse_device_response,
     build_discovery_packet,
     parse_discovery_response,
+    AES_IV,
 )
 
 __all__ = [
@@ -26,4 +28,5 @@ __all__ = [
     "parse_device_response",
     "build_discovery_packet",
     "parse_discovery_response",
+    "AES_IV",
 ]

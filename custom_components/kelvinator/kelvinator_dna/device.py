@@ -130,22 +130,13 @@ class KelvinatorDevice:
         # Parse AES key
         self._key = bytes.fromhex(self.aes_key)
 
-        # Parse DID to get device_id (DID is 16 bytes; extract meaningful device_id
-        # from the last portion or use Broadlink auth to obtain it)
-        did_bytes = bytes.fromhex(self.did)
-        if len(did_bytes) >= 4:
-            # For Kelvinator DIDs (00000000000000000000a1b2c3d4e5f6),
-            # the device_id is derived from the last 4 bytes (MAC hash)
-            self._device_id = struct.unpack('<I', did_bytes[-4:])[0]
-        else:
-            self._device_id = 0
-
-        # Create the underlying Broadlink device
+        # Create the underlying Broadlink device.
+        # device_id is initially 0 — it is set during auth().
         self._bldev = BroadlinkDevice(
             host=self.ip,
             mac=self._mac,
             device_type=AC_DEVTYPE,
-            device_id=self._device_id,
+            device_id=0,
             key=self._key,
             timeout=self.timeout,
         )
@@ -157,15 +148,18 @@ class KelvinatorDevice:
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
-        """Authenticate with the device."""
+        """Authenticate with the device, then install the cloud key."""
         if self._bldev._authenticated:
             return
         ok = self._bldev.auth()
         if ok:
-            # Update device_id from auth response
-            self._device_id = self._bldev.device_id
+            # After auth, the device_id is obtained from the handshake.
+            # Replace the session key with our per-device cloud key
+            # (this is what the official Electrolux app does).
+            self._bldev.update_key(self._key)
             logger.info(
-                "Connected & authenticated: device_id=0x%08x", self._device_id
+                "Connected & authenticated: device_id=0x%08x",
+                self._bldev.device_id,
             )
         else:
             logger.warning("Auth handshake incomplete; trying without auth")
@@ -188,15 +182,18 @@ class KelvinatorDevice:
 
     def _send_and_receive(self, command: int, payload: bytes) -> bytes:
         """
-        Send a command payload and receive the decrypted response.
+        Send a command payload and receive the decrypted response payload.
 
-        Delegates to BroadlinkDevice.send_command() which handles:
-          - 0x38-byte header construction
-          - AES-CBC encryption (checksum + pad + encrypt)
+        Uses the corrected broadlink_api.BroadlinkDevice which handles:
+          - 0x38-byte header with magic bytes and checksums
+          - AES-128-CBC encryption with zero-padding
           - UDP send/recv
-          - AES-CBC decryption (decrypt + unpad + verify checksum)
+          - Response decryption (including zero-padding strip)
         """
-        result = self._bldev.send_command(payload)
+        if command == CMD_DEVICE_STATUS:
+            result = self._bldev.get_status()
+        else:
+            result = self._bldev.send_command(payload)
         return result.get("payload", b"")
 
     # ------------------------------------------------------------------
