@@ -127,6 +127,14 @@ class BroadlinkDevice:
             True if authentication succeeded.
         """
         # Build auth payload (matches python-broadlink's auth())
+        # Auth MUST use the BroadLink default key (INIT_KEY), NOT the
+        # per-device cloud key.  python-broadlink resets via
+        # update_aes(__INIT_KEY) at the start of auth().  Encrypting the
+        # auth request with the cloud key makes the device reject it
+        # (errno -6).  The cloud key is installed by update_key() AFTER
+        # a successful handshake.
+        self.key = self._default_key()
+
         packet = bytearray(0x50)
         packet[0x04:0x14] = bytes([0x31] * 16)
         packet[0x1E] = 0x01
@@ -138,8 +146,19 @@ class BroadlinkDevice:
         if len(response) < 0x38:
             return False
 
-        # Decrypt response payload with current (default) key
-        decrypted = broadlink_decrypt(response[0x38:], self.key, AES_IV)
+        # Check device error status at 0x22:0x24 (signed LE).
+        error_code = struct.unpack_from("<h", response, 0x22)[0]
+        if error_code != 0:
+            raise RuntimeError(f"Device rejected auth: errno {error_code}")
+
+        # Decrypt the auth response with the DEFAULT key (the same key the
+        # request was encrypted with).  Use raw AESCipher.decrypt() rather
+        # than broadlink_decrypt(), because rstrip(b'\x00') would corrupt a
+        # session key that legitimately ends in NUL bytes.
+        cipher = AESCipher(self.key, iv=AES_IV)
+        decrypted = cipher.decrypt(response[0x38:])
+        if len(decrypted) < 0x14:
+            return False
 
         # Extract device ID (first 4 bytes) and session key (next 16 bytes)
         self.device_id = int.from_bytes(decrypted[:0x4], "little")
@@ -172,9 +191,19 @@ class BroadlinkDevice:
         response = self._send_packet(CMD_DEVICE_CONTROL, command_data)
         return parse_device_response(response, self.key)
 
-    def get_status(self) -> Dict[str, Any]:
-        """
-        Query device status (0x6B).
+    def get_status(self, payload: bytes = b'\x00') -> Dict[str, Any]:
+        """Query device status.
+
+        For Kelvinator/Electrolux ACs the status query is a TFB payload
+        (command_type=0x02) sent with the same Broadlink command byte 0x6A
+        as control commands; the TFB ``command_type`` field distinguishes
+        set (0x01) from query (0x02).  The caller MUST pass the built TFB
+        query payload — the previous default of ``b'\x00'`` was sent
+        verbatim, which the device could not parse, yielding empty/error
+        responses ("Status payload too short: 0 bytes").
+
+        Args:
+            payload: Built TFB status-query payload (unencrypted)
 
         Returns:
             Parsed response dictionary with 'payload' key.
@@ -182,7 +211,7 @@ class BroadlinkDevice:
         if not self._authenticated:
             self.auth()
 
-        response = self._send_packet(CMD_DEVICE_STATUS, b'\x00')
+        response = self._send_packet(CMD_DEVICE_CONTROL, payload)
         return parse_device_response(response, self.key)
 
     @classmethod

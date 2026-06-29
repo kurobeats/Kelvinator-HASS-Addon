@@ -120,12 +120,17 @@ def build_device_command(
     encrypted_payload = cipher.encrypt(padded)
 
     # Assemble: header + encrypted payload
-    packet = bytes(header) + encrypted_payload
+    packet = bytearray(header)
+    packet.extend(encrypted_payload)
 
-    # Header checksum (covers header only, NOT the payload)
-    h_checksum = (sum(header, 0xBEAF)) & 0xFFFF
-    packet = bytearray(packet)
-    struct.pack_into("<H", packet, 0x20, h_checksum)
+    # Header checksum covers the ENTIRE packet (header + encrypted payload),
+    # matching python-broadlink's send_packet(): the checksum field at
+    # 0x20:0x22 is still zero here, and sum() is taken over the whole buffer.
+    # The previous code summed only the 0x38 header, producing a checksum
+    # that omitted the encrypted payload bytes -> devices that validate it
+    # reject the packet with errno -6 ("Structure is abnormal").
+    h_checksum = (sum(packet, 0xBEAF)) & 0xFFFF
+    packet[0x20:0x22] = h_checksum.to_bytes(2, "little")
 
     return bytes(packet)
 
@@ -159,6 +164,17 @@ def parse_device_response(
     error_code = struct.unpack_from("<h", data, 0x22)[0]
 
     encrypted_payload = data[HEADER_SIZE:]
+
+    # Error status field at 0x22:0x24 (signed little-endian).
+    # python-broadlink calls e.check_error(response[0x22:0x24]) on every
+    # response; a non-zero value means the device rejected the request
+    # (e.g. -6 == "Structure is abnormal").  We must surface it instead of
+    # blindly decrypting an (often empty) error payload.
+    if error_code != 0:
+        raise RuntimeError(
+            f"Device rejected command: errno {error_code} "
+            f"(e.g. -6 = Structure is abnormal)"
+        )
 
     # Decrypt the payload
     cipher = AESCipher(device_key, iv=AES_IV)

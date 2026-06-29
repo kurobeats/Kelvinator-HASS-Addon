@@ -151,19 +151,22 @@ class KelvinatorDevice:
         """Authenticate with the device, then install the cloud key."""
         if self._bldev._authenticated:
             return
-        ok = self._bldev.auth()
-        if ok:
-            # After auth, the device_id is obtained from the handshake.
-            # Replace the session key with our per-device cloud key
-            # (this is what the official Electrolux app does).
-            self._bldev.update_key(self._key)
-            logger.info(
-                "Connected & authenticated: device_id=0x%08x",
-                self._bldev.device_id,
+        if not self._bldev.auth():
+            # Do NOT pretend authentication succeeded.  The previous code
+            # set _authenticated=True on failure, which then sent commands
+            # with device_id=0 and the wrong key -> errno -6 / empty
+            # responses.  Fail loudly instead.
+            raise RuntimeError(
+                f"Device authentication failed for {self.ip} ({self._mac_str})"
             )
-        else:
-            logger.warning("Auth handshake incomplete; trying without auth")
-            self._bldev._authenticated = True
+        # After auth, the device_id is obtained from the handshake.
+        # Replace the session key with our per-device cloud key
+        # (this is what the official Electrolux app does).
+        self._bldev.update_key(self._key)
+        logger.info(
+            "Connected & authenticated: device_id=0x%08x",
+            self._bldev.device_id,
+        )
 
     def disconnect(self) -> None:
         """Reset authentication state."""
@@ -184,14 +187,14 @@ class KelvinatorDevice:
         """
         Send a command payload and receive the decrypted response payload.
 
-        Uses the corrected broadlink_api.BroadlinkDevice which handles:
-          - 0x38-byte header with magic bytes and checksums
-          - AES-128-CBC encryption with zero-padding
-          - UDP send/recv
-          - Response decryption (including zero-padding strip)
+        Both control (TFB command_type=0x01) and status query (0x02) are sent
+        with Broadlink command byte 0x6A; the TFB ``command_type`` field
+        inside the payload distinguishes them.  The payload built by the
+        caller (build_control_payload) MUST be forwarded unchanged — the
+        previous get_status() call discarded it and sent b'\x00'.
         """
         if command == CMD_DEVICE_STATUS:
-            result = self._bldev.get_status()
+            result = self._bldev.get_status(payload)
         else:
             result = self._bldev.send_command(payload)
         return result.get("payload", b"")

@@ -169,6 +169,11 @@ def parse_status_payload(data: bytes) -> Dict[str, Any]:
     while pos + 2 <= len(data):
         param_id = data[pos]
         param_len = data[pos + 1]
+        # A param_id of 0x00 with length 0x00 marks the start of the
+        # zero-padding region (NUL-fill to the AES block boundary).
+        # Stop here so we don't synthesize spurious param_0x00 entries.
+        if param_id == 0x00 and param_len == 0x00:
+            break
         pos += 2
 
         if pos + param_len > len(data):

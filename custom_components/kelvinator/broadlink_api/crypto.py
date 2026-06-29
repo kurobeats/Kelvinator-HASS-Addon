@@ -9,6 +9,8 @@ Matches the python-broadlink library's implementation:
 - No checksum inside the ciphertext (checksum is in the protocol header)
 """
 
+import struct
+
 from hashlib import md5
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
