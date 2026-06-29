@@ -62,17 +62,18 @@ class DeviceStatus:
     power: bool = False
     mode: int = 0           # 0=cool, 1=heat, 2=auto, 3=fan, 4=dry
     temp: int = 24
-    fan: int = 0            # 0=auto, 1=low, 2=med, 3=high
+    fan: int = 0            # 0=auto, 1=low, 2=med, 3=high, 5=turbo
     swing: int = 0          # 0=off, 1=vert, 2=horiz, 3=both
     sleep: bool = False
     turbo: bool = False
+    screen_display: bool = True
     room_temp: Optional[int] = None
     error_code: int = 0
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         mode_names = {0: "COOL", 1: "HEAT", 2: "AUTO", 3: "FAN", 4: "DRY"}
-        fan_names = {0: "AUTO", 1: "LOW", 2: "MED", 3: "HIGH"}
+        fan_names = {0: "AUTO", 1: "LOW", 2: "MED", 3: "HIGH", 5: "TURBO"}
         swing_names = {0: "OFF", 1: "VERT", 2: "HORIZ", 3: "BOTH"}
 
         parts = [
@@ -88,6 +89,8 @@ class DeviceStatus:
             parts.append("sleep=ON")
         if self.turbo:
             parts.append("turbo=ON")
+        if not self.screen_display:
+            parts.append("display=OFF")
         return f"DeviceStatus({', '.join(parts)})"
 
 
@@ -127,10 +130,13 @@ class KelvinatorDevice:
         # Parse AES key
         self._key = bytes.fromhex(self.aes_key)
 
-        # Parse DID to get device_id (first 4 bytes as little-endian)
+        # Parse DID to get device_id (DID is 16 bytes; extract meaningful device_id
+        # from the last portion or use Broadlink auth to obtain it)
         did_bytes = bytes.fromhex(self.did)
         if len(did_bytes) >= 4:
-            self._device_id = struct.unpack('<I', did_bytes[:4])[0]
+            # For Kelvinator DIDs (00000000000000000000a1b2c3d4e5f6),
+            # the device_id is derived from the last 4 bytes (MAC hash)
+            self._device_id = struct.unpack('<I', did_bytes[-4:])[0]
         else:
             self._device_id = 0
 
@@ -216,6 +222,7 @@ class KelvinatorDevice:
             swing=status_data.get('swing', 0),
             sleep=status_data.get('sleep', False),
             turbo=status_data.get('turbo', False),
+            screen_display=status_data.get('screen_display', True),
             room_temp=status_data.get('room_temp'),
             error_code=status_data.get('error_code', 0),
             raw=status_data,
@@ -265,6 +272,9 @@ class KelvinatorDevice:
 
     def set_turbo(self, enabled: bool) -> None:
         self._pending_params['turbo'] = enabled
+
+    def set_screen_display(self, enabled: bool) -> None:
+        self._pending_params['screen_display'] = enabled
 
     def send_control(self) -> None:
         """Send accumulated individual parameter changes to the device."""

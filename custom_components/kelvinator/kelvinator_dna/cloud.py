@@ -29,7 +29,6 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -282,11 +281,19 @@ class KelvinatorCloud:
     def _encrypt_family_body(self, plaintext: str) -> bytes:
         """
         AES-CBC encrypt the JSON body using the server key from /ec4/v1/common/api.
+
+        The BroadLink family API uses *zero-padding* (NUL bytes) instead of PKCS7.
+        The plaintext is padded to (ceil(len/16) + 1) × 16 bytes with NUL bytes,
+        matching the real app behaviour observed in HAR captures.
         """
         if not self._server_key:
             self._server_key = bytes.fromhex(self.credentials.api_key)
+        data = plaintext.encode()
+        # Zero-pad to (ceil(len/16) + 1) * 16 bytes
+        padded_len = ((len(data) // 16) + 2) * 16
+        zero_padded = data.ljust(padded_len, b'\x00')
         cipher = AES.new(self._server_key, AES.MODE_CBC, iv=AES_IV)
-        return cipher.encrypt(pad(plaintext.encode(), AES.block_size))
+        return cipher.encrypt(zero_padded)
 
     def _generate_family_token(self, plaintext: str, timestamp: int) -> str:
         """Generate MD5 token for Family API endpoints."""

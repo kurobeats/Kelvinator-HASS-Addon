@@ -17,15 +17,25 @@ class ACMode(IntEnum):
 
 
 class FanSpeed(IntEnum):
-    """Fan speed settings."""
+    """Fan speed settings (verified against HAR telemetry).
+
+    The Kelvinator app uses the internal name ``ac_mark`` for fan speed.
+    Values 0-3 are standard speeds; 5 is the TURBO / maximum-speed mode.
+    (Value 4 is skipped in the real app.)
+    """
     AUTO = 0
     LOW = 1
     MEDIUM = 2
     HIGH = 3
+    TURBO = 5
 
 
 class SwingMode(IntEnum):
-    """Swing/louver direction modes."""
+    """Swing/louver direction modes.
+
+    HAR telemetry shows ``ac_vdir`` with values 0 (off) and 1 (vertical on).
+    Horizontal and both modes are defined in the protocol but not yet observed.
+    """
     OFF = 0
     VERTICAL = 1
     HORIZONTAL = 2
@@ -52,6 +62,7 @@ class ACState:
     swing: int = SwingMode.OFF
     sleep: bool = False
     turbo: bool = False
+    screen_display: bool = True  # Screen display brightness on/off
     temp_unit: int = 0  # 0=Celsius, 1=Fahrenheit
 
     def to_dict(self) -> dict:
@@ -63,6 +74,7 @@ class ACState:
             'swing': int(self.swing),
             'sleep': self.sleep,
             'turbo': self.turbo,
+            'screen_display': self.screen_display,
             'temp_unit': self.temp_unit,
         }
 
@@ -76,12 +88,13 @@ class ACState:
             swing=data.get('swing', SwingMode.OFF),
             sleep=data.get('sleep', False),
             turbo=data.get('turbo', False),
+            screen_display=data.get('screen_display', True),
             temp_unit=data.get('temp_unit', 0),
         )
 
     def __repr__(self) -> str:
         mode_names = {0: "COOL", 1: "HEAT", 2: "AUTO", 3: "FAN", 4: "DRY"}
-        fan_names = {0: "AUTO", 1: "LOW", 2: "MED", 3: "HIGH"}
+        fan_names = {0: "AUTO", 1: "LOW", 2: "MED", 3: "HIGH", 5: "TURBO"}
         swing_names = {0: "OFF", 1: "VERT", 2: "HORIZ", 3: "BOTH"}
 
         parts = [
@@ -95,4 +108,6 @@ class ACState:
             parts.append("sleep=ON")
         if self.turbo:
             parts.append("turbo=ON")
+        if not self.screen_display:
+            parts.append("display=OFF")
         return f"ACState({', '.join(parts)})"
