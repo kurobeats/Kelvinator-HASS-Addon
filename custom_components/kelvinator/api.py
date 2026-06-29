@@ -238,16 +238,40 @@ class DNALocalRelay:
     which Electrolux/Kelvinator ACs (devtype 0x4F9B/20379) speak natively.
 
     After authentication the transport AES key is replaced with the
-    per-device cloud key so that payload encryption matches what the
-    official app sends (AES-128-CBC + zero-padding).
+    per-device cloud key (matching the official app behaviour).
 
-    Payloads are serialised in the Java BLStdControlParam JSON format
-    that libNetworkAPI.so passes to the BroadLink firmware:
-      {"act": "get|set", "params": ["ac_pwr", …], "vals": [[…], …]}
+    Commands are serialised as TFB (Type-Field-Body) binary payloads
+    — the native wire format that the AC firmware understands.
+    The device does NOT speak JSON over the wire.
     """
 
     # Devtype for Electrolux / Kelvinator AC units
     AC_DEVTYPE = 0x4F9B  # 20379
+
+    # Map HA-level param names → TFB payload-param names
+    _HA_PARAM_TO_TFB = {
+        "power": "power",
+        "mode": "mode",
+        "temp": "temp",
+        "fan": "fan",
+        "vdir": "swing",
+        "hdir": "swing",
+        "sleep": "sleep",
+        "turbo": "turbo",
+        "screen_display": "screen_display",
+    }
+
+    # Map TFB response-param names → app-level JSON key names
+    _TFB_TO_APP = {
+        "power": "ac_pwr",
+        "mode": "ac_mode",
+        "temp": "temp",
+        "fan": "ac_mark",
+        "room_temp": "envtemp",
+        "error_code": "ac_errcode",
+        "swing": "ac_vdir",
+        "sleep": "ac_slp",
+    }
 
     def __init__(self) -> None:
         self._devices: dict[str, "_BroadlinkDevice"] = {}
@@ -261,37 +285,59 @@ class DNALocalRelay:
         self,
         did: str, mac: str, aes_key: str, password: int, command_json: str,
     ) -> dict:
-        """Send a control command to the device via local UDP."""
+        """Send a control command to the device via local UDP.
+
+        command_json is a JSON string ``{"did": ..., "params": {...}}``
+        where ``params`` keys are HA-level names (power, mode, temp, fan,
+        vdir, hdir, sleep, turbo, screen_display).
+        """
         try:
             dev = self._get_device(did, mac, aes_key)
             cmd = _json.loads(command_json)
-            params: dict = cmd.get("params", {})
+            ha_params: dict = cmd.get("params", {})
 
-            # Build BLStdControlParam-style param/vals
-            param_names: list[str] = []
-            vals: list[list[dict]] = []
-
-            for key, val in params.items():
-                param_names.append(key)
-                vals.append([{"idx": 1, "val": int(val) if isinstance(val, (int, bool)) else val}])
-
-            if not param_names:
+            if not ha_params:
                 return {"status": 0}
 
-            pkt = _json.dumps({
-                "act": "set",
-                "params": param_names,
-                "vals": vals,
-            }, separators=(",", ":"))
+            # Build TFB params dict from HA params
+            tfb_params: dict[str, Any] = {
+                "did": dev.did,
+                "sub_device_id": 0,
+                "command_type": 0x01,
+            }
+            for ha_name, val in ha_params.items():
+                tfb_name = self._HA_PARAM_TO_TFB.get(ha_name)
+                if tfb_name is None:
+                    _LOGGER.warning("Unknown param %s, skipping", ha_name)
+                    continue
+                # Combine vdir/hdir into the swing bitmask
+                if ha_name == "vdir":
+                    tfb_params["swing"] = (
+                        tfb_params.get("swing", 0) & 0b10
+                    ) | (int(val) & 0b01)
+                elif ha_name == "hdir":
+                    tfb_params["swing"] = (
+                        tfb_params.get("swing", 0) & 0b01
+                    ) | ((int(val) & 0b01) << 1)
+                else:
+                    tfb_params[tfb_name] = val
 
-            self._send_json(dev, pkt)
+            # Import protocol functions here to avoid circular imports
+            from .kelvinator_dna.protocol import build_control_payload
+
+            payload = build_control_payload(tfb_params)
+            self._send_and_recv(dev, 0x6A, payload)
             return {"status": 0}
         except Exception as exc:
             _LOGGER.error("Local command failed for %s: %s", mac, exc)
             return {"status": -1, "message": str(exc)}
 
     def get_status(self, config_json: str) -> dict:
-        """Query device state via local UDP."""
+        """Query device state via local UDP.
+
+        Returns JSON matching the DNACloudRelay response format
+        (app-level field names like ac_pwr, ac_mode, etc.).
+        """
         try:
             config = _json.loads(config_json)
             did = config["did"]
@@ -300,29 +346,52 @@ class DNALocalRelay:
 
             dev = self._get_device(did, mac, aes_key)
 
-            pkt = _json.dumps({"act": "get"}, separators=(",", ":"))
-            resp = self._send_json(dev, pkt)
+            from .kelvinator_dna.protocol import (
+                build_control_payload,
+                parse_status_payload,
+            )
 
-            result = _json.loads(resp)
-            if result.get("status") != 0:
-                _LOGGER.warning("Status query returned error: %s", result)
-                return {"status": -1, "message": result.get("msg", "Unknown error")}
-
-            raw = result.get("data", {})
-            return {
-                "status": 0,
-                "data": {
-                    "ac_pwr": int(raw.get("ac_pwr", 0)),
-                    "ac_mode": int(raw.get("ac_mode", 0)),
-                    "temp": int(float(raw.get("temp", 24))),
-                    "ac_mark": int(raw.get("ac_mark", 0)),
-                    "envtemp": float(raw.get("envtemp", 0)),
-                    "ac_errcode": int(raw.get("ac_errcode", 0)),
-                    "ac_vdir": int(raw.get("ac_vdir", 0)),
-                    "ac_slp": int(raw.get("ac_slp", 0)),
-                    "ac_hdir": int(raw.get("ac_hdir", 0)),
-                },
+            # Build TFB query payload (command_type=0x02 = status query)
+            tfb_params = {
+                "did": dev.did,
+                "sub_device_id": 0,
+                "command_type": 0x02,
             }
+            query = build_control_payload(tfb_params)
+            resp = self._send_and_recv(dev, 0x6A, query)
+
+            # Parse the TFB response
+            parsed = parse_status_payload(resp)
+
+            # Build app-level JSON response
+            data = {}
+            for tfb_key, app_key in self._TFB_TO_APP.items():
+                if tfb_key in parsed:
+                    val = parsed[tfb_key]
+                    if tfb_key == "temp":
+                        val = int(float(val))
+                    elif tfb_key == "room_temp":
+                        val = float(val)
+                    data[app_key] = val
+
+            # Decode swing (combined bitmask) into separate vdir / hdir
+            if "swing" in parsed:
+                swing_val = int(parsed["swing"])
+                data["ac_vdir"] = swing_val & 1
+                data["ac_hdir"] = (swing_val >> 1) & 1
+
+            # Provide defaults for any missing fields
+            data.setdefault("ac_pwr", 0)
+            data.setdefault("ac_mode", 0)
+            data.setdefault("temp", 24)
+            data.setdefault("ac_mark", 0)
+            data.setdefault("envtemp", 0.0)
+            data.setdefault("ac_errcode", 0)
+            data.setdefault("ac_vdir", 0)
+            data.setdefault("ac_slp", 0)
+            data.setdefault("ac_hdir", 0)
+
+            return {"status": 0, "data": data}
         except Exception as exc:
             _LOGGER.error("Local status failed: %s", exc)
             return {"status": -1, "message": str(exc)}
@@ -331,27 +400,28 @@ class DNALocalRelay:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _send_json(self, dev: "_BroadlinkDevice", plaintext: str) -> str:
-        """Send JSON payload to the device and return decrypted JSON response.
+    def _send_and_recv(self, dev: "_BroadlinkDevice", cmd_byte: int, tfb_payload: bytes) -> bytes:
+        """
+        Send a raw TFB payload and return the decrypted TFB response body.
 
-        The payload is zero-padded, then encrypted with the cloud key.
-        python-broadlink's send_packet() handles the transport encryption
-        (its own AES-CBC layer with the key we set via update_aes).
+        The payload goes through three layers:
+          1. send_packet(0x6A, tfb_payload) — zero-pads and encrypts with
+             the cloud key (installed in :meth:`connect`).
+          2. The device decrypts with its cloud key, processes the TFB
+             command, and returns a TFB response.
+          3. We decrypt the response and strip zero-padding.
 
-        We do NOT double-encrypt: send_packet() is responsible for the
-        single encryption layer, using the cloud key we installed after auth.
+        There is NO UTF-8 decode — the TFB payload is pure binary.
         """
         import broadlink
 
-        payload = plaintext.encode("utf-8")
-        resp = dev.broadlink.send_packet(0x6A, payload)
+        resp = dev.broadlink.send_packet(cmd_byte, tfb_payload)
         broadlink.exceptions.check_error(resp[0x22:0x24])
 
-        # send_packet returns RAW bytes; decrypt the response payload
+        # Decrypt response payload (still encrypted by send_packet)
         decrypted = dev.broadlink.decrypt(resp[0x38:])
-        # Strip zero-padding (the device zero-pads responses)
-        decrypted = decrypted.rstrip(b"\x00")
-        return decrypted.decode("utf-8")
+        # Strip zero-padding (device uses NUL bytes, not PKCS7)
+        return decrypted.rstrip(b"\x00")
 
     def _get_device(
         self, did: str, mac: str, aes_key: str,
@@ -371,6 +441,7 @@ class DNALocalRelay:
                 )
             dev = _BroadlinkDevice(
                 ip=ip, mac=mac, aes_key=aes_key, devtype=self.AC_DEVTYPE,
+                did=did,
             )
             dev.connect()
             self._devices[did] = dev
@@ -416,9 +487,12 @@ class _BroadlinkDevice:
     from the server.
     """
 
-    def __init__(self, ip: str, mac: str, aes_key: str, devtype: int) -> None:
+    def __init__(
+        self, ip: str, mac: str, aes_key: str, devtype: int, did: str = "",
+    ) -> None:
         self.ip = ip
         self.mac = mac
+        self.did = did  # 32-char hex DID, used in TFB payload building
         self._devtype = devtype
         self._aes_key = aes_key
         self.broadlink = None
