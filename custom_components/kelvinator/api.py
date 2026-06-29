@@ -34,7 +34,21 @@ _SO_PATH = os.environ.get(
     "KELVINATOR_SO_PATH",
     os.path.join(_SO_DIR, "libNetworkAPI.so"),
 )
+
+# Unlike _SO_AVAILABLE (which only checks os.path.exists), this tests
+# whether the SO can *actually* be loaded.  The SO is an Android ARM
+# binary that depends on NDK libraries (liblog.so, etc.) which are not
+# present on standard Linux / Home Assistant systems.  If the file
+# exists but ctypes.CDLL fails, _SO_LOAD_ERROR contains the reason.
 _SO_AVAILABLE = os.path.exists(_SO_PATH)
+_SO_LOAD_ERROR: Optional[str] = None
+
+if _SO_AVAILABLE:
+    try:
+        import ctypes
+        ctypes.CDLL(_SO_PATH)
+    except Exception as exc:
+        _SO_LOAD_ERROR = str(exc)
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -232,49 +246,40 @@ class DNACloudRelay:
 
 class DNALocalRelay:
     """
-    Local UDP control fallback when libNetworkAPI.so is not available.
+    No-op fallback when local/cloud control is unavailable.
 
-    The Kelvinator/Electrolux AC wire protocol is proprietary and requires
-    the libNetworkAPI.so native library for reliable communication.
-    Without it, local UDP control is not supported.
-
-    This class exists solely to provide a graceful degradation path:
-    it logs a clear warning once and returns failure responses so the
-    integration marks the device as unavailable instead of spamming
-    error logs every poll cycle.
+    Logs a single WARNING-level message explaining *why* control is
+    unavailable (SO not found, SO cannot load, etc.) and returns
+    failure responses so the integration marks the device as
+    unavailable instead of spamming error logs.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, reason: str = "libNetworkAPI.so not found") -> None:
+        self._reason = reason
         self._warned: bool = False
 
-    # ------------------------------------------------------------------
-    # Public interface (matches DNACloudRelay plus DNALocalRelay)
-    # ------------------------------------------------------------------
+    def _warn_once(self) -> None:
+        if self._warned:
+            return
+        self._warned = True
+        _LOGGER.warning(
+            "Cloud relay is unavailable (%s). "
+            "Local UDP control requires libNetworkAPI.so which is an Android "
+            "ARM binary and will not load on standard Linux / Home Assistant "
+            "systems.  Device status and commands are disabled.",
+            self._reason,
+        )
 
     def send_command(
         self,
         did: str, mac: str, aes_key: str, password: int, command_json: str,
     ) -> dict:
-        """Return a failure — local UDP control is unavailable."""
-        if not self._warned:
-            self._warned = True
-            _LOGGER.warning(
-                "Local UDP control requires libNetworkAPI.so which was not found. "
-                "Install the library or use a different integration setup. "
-                "Commands will not reach the device."
-            )
-        return {"status": -1, "message": "Local UDP control unavailable; install libNetworkAPI.so"}
+        self._warn_once()
+        return {"status": -1, "message": "Cloud relay unavailable"}
 
     def get_status(self, config_json: str) -> dict:
-        """Return a failure — device status unavailable locally."""
-        if not self._warned:
-            self._warned = True
-            _LOGGER.warning(
-                "Local UDP control requires libNetworkAPI.so which was not found. "
-                "Install the library or use a different integration setup. "
-                "Device status unavailable."
-            )
-        return {"status": -1, "message": "Local UDP control unavailable; install libNetworkAPI.so"}
+        self._warn_once()
+        return {"status": -1, "message": "Cloud relay unavailable"}
 
 
 # ---------------------------------------------------------------------------
@@ -364,10 +369,14 @@ CloudACDevice = KelvinatorACDevice
 
 def get_dna_relay() -> Optional[DNACloudRelay | DNALocalRelay]:
     """Get the DNA relay — cloud relay preferred, local UDP as fallback."""
+    if _SO_LOAD_ERROR is not None:
+        # SO file exists but cannot load (e.g. missing liblog.so —
+        # it's an Android ARM binary).  Don't bother retrying.
+        _LOGGER.info("libNetworkAPI.so found but cannot load: %s", _SO_LOAD_ERROR)
+        return DNALocalRelay(reason=_SO_LOAD_ERROR)
+
     if _SO_AVAILABLE:
-        try:
-            return DNACloudRelay()
-        except Exception as exc:
-            _LOGGER.warning("Failed to init cloud relay: %s", exc)
-    _LOGGER.info("Cloud relay unavailable — using local UDP control")
-    return DNALocalRelay()
+        return DNACloudRelay()
+
+    _LOGGER.info("libNetworkAPI.so not found — cloud relay unavailable")
+    return DNALocalRelay(reason="libNetworkAPI.so not found")
