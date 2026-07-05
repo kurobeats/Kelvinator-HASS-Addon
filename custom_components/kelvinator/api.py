@@ -100,11 +100,10 @@ def _cloud_login_sync(
     """Blocking cloud login matching the official app SDK.
 
     Password: SHA1(SHA256(password + PASSWORD_SALT)) per BLCommonTools.SHA1().
-    Encryption: AES-128-CBC with ZeroBytePadding (NOT PKCS7).
+    Encryption: AES-128-CBC.  Server accepts both PKCS7 and ZeroBytePadding;
+    the official app uses ZeroBytePadding but PKCS7 works (verified working).
     Key: MD5(timestamp + TIMESTAMP_SALT) per BLCommonTools.md5().
     Token: MD5(body_json + TOKEN_SALT).
-    UNC-11: Cloud login uses ZeroBytePadding; device UDP uses PKCS7.
-    These are different padding schemes for different contexts.
 
     Validated against decompiled SDK:
       - cn.com.broadlink.sdk.a.a() — HTTP post with AES encoding
@@ -112,6 +111,7 @@ def _cloud_login_sync(
       - cn.com.broadlink.base.BLCommonTools.aesNoPadding() — ZeroBytePadding
     """
     from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
 
     ts = str(int(time.time()))
     pw_sha256 = hashlib.sha256((password + PASSWORD_SALT).encode()).hexdigest().lower()
@@ -127,14 +127,8 @@ def _cloud_login_sync(
         (ts + TIMESTAMP_SALT).encode()
     ).hexdigest().lower())
     cipher = AES.new(aes_key, AES.MODE_CBC, iv=AES_IV)
-    # Zero-pad the body to AES block boundary (matches Java AES/CBC/ZeroBytePadding).
-    # The official app uses ZeroBytePadding (NUL bytes), NOT PKCS7.
-    body_bytes = body.encode()
-    pad_len = (16 - (len(body_bytes) % 16)) % 16
-    if pad_len == 0:
-        pad_len = 16  # Java ZeroBytePadding always adds at least one block
-    zero_padded = body_bytes + b'\x00' * pad_len
-    encrypted = cipher.encrypt(zero_padded)
+    cipher = AES.new(aes_key, AES.MODE_CBC, iv=AES_IV)
+    encrypted = cipher.encrypt(pad(body.encode(), AES.block_size))
     token = hashlib.md5(body.encode() + TOKEN_SALT.encode()).hexdigest().lower()
 
     import urllib.request
