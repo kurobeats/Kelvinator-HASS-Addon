@@ -221,4 +221,5 @@ tests/
 
 # pi dev things
 .pi/
-.pi-subagents/
+.pi-subagents/testing/auth_results.json
+testing/auth_results.json
