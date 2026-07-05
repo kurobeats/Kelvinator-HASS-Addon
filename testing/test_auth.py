@@ -519,6 +519,8 @@ def main():
     p = argparse.ArgumentParser(description="Kelvinator auth test harness")
     p.add_argument("--live", nargs=2, metavar=("EMAIL", "PASSWORD"),
                    help="Attempt real cloud login")
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="Prompt for email and password, then attempt live login")
     p.add_argument("--json-out", action="store_true",
                    help="Write JSON report to testing/auth_results.json")
     args = p.parse_args()
@@ -548,7 +550,16 @@ def main():
 
     # --- LIVE test ---
     live_ok = None
-    if args.live:
+    if args.interactive:
+        from getpass import getpass
+        print()
+        email = input("Email (or phone): ").strip()
+        password = getpass("Password: ")
+        if email and password:
+            live_ok = t_live_login(r, email, password)
+        else:
+            print("  SKIP: empty credentials")
+    elif args.live:
         live_ok = t_live_login(r, args.live[0], args.live[1])
 
     ok = r.done()
