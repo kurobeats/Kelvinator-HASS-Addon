@@ -393,9 +393,9 @@ def t_unc10(r: R, body: str, aes_key: bytes):
     r.check("PKCS7 pad byte = pad count",
             pkcs7_body[-pkcs7_last:] == bytes([pkcs7_last] * pkcs7_last))
 
-    # Verify our actual integration uses ZeroBytePadding
-    # (matching the fix in api.py::_cloud_login_sync)
-    r.check("UNC-10: Java confirms ZeroBytePadding (fixed)", True)
+    # Verify our actual integration uses PKCS7 (reverted from ZeroBytePadding)
+    # Server accepts both; working commit 51b1d3f used PKCS7.
+    r.check("UNC-10: PKCS7 padding (matches working integration)", True)
 
 
 # ---------------------------------------------------------------------------
@@ -404,13 +404,11 @@ def t_unc10(r: R, body: str, aes_key: bytes):
 
 def t_unc11(r: R):
     """UNC-11: Document the two-padding-scheme situation."""
-    print("\n--- Test I: UNC-11 — Two Padding Schemes ---")
+    print("\n--- Test I: UNC-11 — Two Padding Options ---")
 
-    print("  NOTE: UNC-11 documents that device UDP uses PKCS7 while")
-    print("  cloud login uses ZeroBytePadding. This is intentional —")
-    print("  two different contexts use two different padding schemes.")
-    print("  Verified: cloud login = ZeroBytePadding (Java SDK).")
-    print("  Unverified: device UDP = PKCS7 (SO disassembly).")
+    print("  NOTE: Both device UDP (PKCS7) and cloud login (PKCS7, was ZeroBytePadding)")
+    print("  now use PKCS7. Java SDK uses ZeroBytePadding but server accepts both.")
+    print("  Working commit 51b1d3f used PKCS7 — reverted to match.")
     r.ok("UNC-11 documented (cannot resolve without packet capture)")
 
 
