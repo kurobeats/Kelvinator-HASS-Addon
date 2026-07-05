@@ -39,7 +39,10 @@ PARAM_POWER = 0x01       # ac_pwr: power (0/1)
 PARAM_MODE = 0x02        # ac_mode: 0=cool, 1=heat, 2=dry, 3=fan, 4=auto
 PARAM_TEMP = 0x03        # ac_temp: target temp (°C)
 PARAM_FAN = 0x04         # ac_mark: fan speed (0=auto, 1=low, 2=med, 3=high, 4=turbo, 5=quiet, 6=low_med, 7=med_high)
-PARAM_SWING = 0x05       # ac_vdir: swing (0=off, 1=vert, 2=horiz, 3=both)
+PARAM_SWING = 0x05       # UNC-03: ac_vdir: vertical swing (0=off, 1=on).
+# Horizontal swing (ac_hdir) param ID unknown — may be 0x0C or separate.
+# The app sends ac_vdir and ac_hdir as two independent string params.
+# Until verified, only vertical swing is supported via PARAM_SWING.
 PARAM_SLEEP = 0x06       # ac_slp: sleep (0/1)
 PARAM_TURBO = 0x07       # (dedicated turbo toggle; may be unused — turbo is a fan level)
 PARAM_TEMP_UNIT = 0x08   # temperature unit (0=°C, 1=°F)
@@ -53,6 +56,8 @@ PARAM_NAMES = {
     PARAM_TEMP: 'temp',
     PARAM_FAN: 'fan',
     PARAM_SWING: 'swing',
+    # UNC-06: PARAM_TURBO=0x07 likely unused — turbo is ac_mark=4
+    # Verified: DeviceFanActivity.java sends "ac_mark" with value 4 for turbo.
     PARAM_SLEEP: 'sleep',
     PARAM_TURBO: 'turbo',
     PARAM_TEMP_UNIT: 'temp_unit',
@@ -112,6 +117,10 @@ def build_control_payload(params: Dict[str, Any]) -> bytes:
     payload.append(params.get('command_type', 0x01))
 
     # Parameter blocks
+    # UNC-01: Param IDs below inferred from binary analysis.  The Java SDK
+    # sends STRING param names ("ac_pwr", "ac_mode", etc.) — the SO maps
+    # them to wire-level IDs internally.  These binary IDs are our best
+    # guess at the SO's internal mapping.  Verify via packet capture.
     _append_param(payload, PARAM_POWER, params.get('power'))
     _append_param(payload, PARAM_MODE, params.get('mode'))
     _append_param(payload, PARAM_TEMP, params.get('temp'))

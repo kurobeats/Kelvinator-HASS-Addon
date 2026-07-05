@@ -159,10 +159,12 @@ class KelvinatorClimate(ClimateEntity):
         self.async_write_ha_state()
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
+        # UNC-03: Horizontal swing (ac_hdir) param ID unknown.
+        # Only vertical swing is supported until verified via packet capture.
+        # The app sends ac_vdir and ac_hdir as two separate string params.
         v = 1 if swing_mode in ("vertical", "both") else 0
-        h = 1 if swing_mode in ("horizontal", "both") else 0
-        await self._device.send_command({"vdir": v, "hdir": h})
-        self._device.state.swing = (1 if v else 0) | (2 if h else 0)
+        await self._device.send_command({"vdir": v})
+        self._device.state.swing = 1 if v else 0
         self.async_write_ha_state()
 
     async def async_turn_on(self) -> None:
