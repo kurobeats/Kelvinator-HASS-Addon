@@ -466,6 +466,10 @@ def t_live_login(r: R, username: str, password: str):
     print(f"  POST {url}")
     print(f"  Content-Type: application/x-java-serialized-object")
     print(f"  Body: {len(body)}B → encrypted {len(encrypted)}B")
+    print(f"  Password hash: {pw_hash[:16]}... (SHA1(SHA256(pw+salt)))")
+    print(f"  AES key (MD5(ts+salt)): {aes_key.hex()[:16]}...")
+    print(f"  Token (MD5(body+TOKEN_SALT)): {token[:16]}...")
+    print(f"  COMPANY_ID: {COMPANY_ID}")
 
     try:
         ctx = ssl.create_default_context()
