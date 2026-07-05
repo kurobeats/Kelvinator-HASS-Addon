@@ -302,6 +302,8 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="Skip network, just verify imports")
     p.add_argument("--ips", nargs="+", default=["192.168.1.101", "192.168.1.102", "192.168.1.103"],
                    help="Direct-probe fallback IPs")
+    p.add_argument("--skip-cloud", action="store_true",
+                   help="Skip cloud login — use hardcoded device credentials from HAR capture")
     args = p.parse_args()
 
     print("=" * 60)
@@ -317,51 +319,62 @@ def main():
         return
 
     # Credentials
-    username = os.environ.get("KELVINATOR_USER", "")
-    password = os.environ.get("KELVINATOR_PASS", "")
-    if not username:
-        username = input("Email/phone: ").strip()
-    if not password:
-        password = getpass("Password: ")
-    if not username or not password:
-        print("Empty credentials.")
-        return
-
-    ok = 0
-    total = 0
-
-    # 1. Cloud login
-    print("\n[1/4] Cloud login...")
-    try:
-        userid, loginsession = cloud_login(username, password)
-        print(f"  OK: userid={userid[:8]}...")
-        ok += 1
-    except Exception as e:
-        print(f"  FAIL: {e}")
-        traceback.print_exc()
-    total += 1
-
-    if not ok:
-        print("\nCannot continue without cloud login.")
-        return
-
-    # 2. Device credentials
-    print("\n[2/4] Fetching device credentials...")
-    try:
-        devices = cloud_get_devices(userid, loginsession)
-        print(f"  OK: {len(devices)} device(s)")
+    if args.skip_cloud:
+        # HAR-captured credentials — no cloud login needed
+        devices = [
+            {"did":"00000000000000000000a1b2c3d4e5f6","mac":"a1:b2:c3:d4:e5:f6",
+             "name":"AC 1","aes_key":"00112233445566778899aabbccddeeff",
+             "password":100000001,"devtype":20379,"pid":"9b4f0000"},
+            {"did":"00000000000000000000a1b2c3d4e6f7","mac":"a1:b2:c3:d4:e6:f7",
+             "name":"AC 2","aes_key":"11223344556677889900aabbccddeeff",
+             "password":100000002,"devtype":20379,"pid":"9b4f0000"},
+            {"did":"00000000000000000000a1b2c3d4e7f8","mac":"a1:b2:c3:d4:e7:f8",
+             "name":"AC 3","aes_key":"223344556677889900aabbccddeeff",
+             "password":100000003,"devtype":20379,"pid":"9b4f0000"},
+        ]
+        print("\nUsing HAR-captured device credentials (skipping cloud)")
         for d in devices:
-            print(f"    {d['name']:20s} mac={d['mac']} did={d['did'][:8]}... key={d['aes_key'][:8]}...")
-        ok += 1
-    except Exception as e:
-        print(f"  FAIL: {e}")
-        traceback.print_exc()
-        devices = []
-    total += 1
+            print(f"  {d['name']}: mac={d['mac']} did={d['did'][:8]}... key={d['aes_key'][:8]}...")
+        ok = 2  # stages 1+2 skipped
+        total = 2
+    else:
+        username = os.environ.get("KELVINATOR_USER", "")
+        password = os.environ.get("KELVINATOR_PASS", "")
+        if not username:
+            username = input("Email/phone: ").strip()
+        if not password:
+            password = getpass("Password: ")
+        if not username or not password:
+            print("Empty credentials.")
+            return
 
-    if not devices:
-        print("\nNo devices to test.")
-        return
+        ok = 0; total = 0
+
+        # 1. Cloud login
+        print("\n[1/4] Cloud login...")
+        try:
+            userid, loginsession = cloud_login(username, password)
+            print(f"  OK: userid={userid[:8]}...")
+            ok += 1
+        except Exception as e:
+            print(f"  FAIL: {e}"); traceback.print_exc()
+        total += 1
+        if not ok:
+            print("\nCannot continue without cloud login."); return
+
+        # 2. Device credentials
+        print("\n[2/4] Fetching device credentials...")
+        try:
+            devices = cloud_get_devices(userid, loginsession)
+            print(f"  OK: {len(devices)} device(s)")
+            for d in devices:
+                print(f"    {d['name']:20s} mac={d['mac']} did={d['did'][:8]}... key={d['aes_key'][:8]}...")
+            ok += 1
+        except Exception as e:
+            print(f"  FAIL: {e}"); traceback.print_exc(); devices = []
+        total += 1
+        if not devices:
+            print("\nNo devices to test."); return
 
     # 3. LAN discovery
     print("\n[3/4] LAN discovery...")
