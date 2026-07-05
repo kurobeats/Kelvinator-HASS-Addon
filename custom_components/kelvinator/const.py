@@ -29,7 +29,7 @@ TIMESTAMP_SALT = "kdixkdqp54545^#*"
 PASSWORD_SALT = "4969fj#k23#"
 DEFAULT_LICENSE_ID = "bddb4af53f74edaa03b1aa439b75e7a6"
 
-# Company ID extracted from AirApplication.java license (bytes 120:136)
+# Company ID extracted from AirApplication.java License blob (bytes 56:72)
 COMPANY_ID = "98273b1f0638bc7819793d58da055d36"
 
 # ---------------------------------------------------------------------------
