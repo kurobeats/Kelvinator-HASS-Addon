@@ -29,6 +29,9 @@ Encryption:
   - AES-128-CBC with a hardcoded IV (562e17996d093d28ddb3ba695a2e6f58)
   - Key: either the BroadLink default key or the per-device cloud key
   - Padding: PKCS7 (confirmed by Ghidra analysis of libNetworkAPI.so bl_sdk_tfb_encode)
+  - UNC-05: checksum uses sum(packet, 0xBEAF) matching python-broadlink.
+    SO has Fletcher-16 variant with seeds (5,10) — verify which algorithm
+    the device actually uses.
   - Payload checksum is computed BEFORE encryption
   - Header checksum covers header fields only (before appending encrypted payload)
 

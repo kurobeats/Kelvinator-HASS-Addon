@@ -31,8 +31,10 @@ CMD_AUTH = 0x65             # Authentication handshake
 AC_DEVTYPE = 0x4F9B  # 20379
 
 # --- Control Payload Parameter IDs ---
-# These IDs come from the decompiled libNetworkAPI.so binary.
-# The app-level names (from HAR telemetry) are shown in comments for reference.
+# UNC-01: These IDs (0x01-0x0B) are inferred from libNetworkAPI.so binary
+# analysis.  They have NOT been validated against live device traffic.
+# Verify via Frida hook or UDP packet capture before relying on local UDP.
+# UNC-06: PARAM_TURBO=0x07 semantics unclear — may be unused (turbo is fan=4)
 PARAM_POWER = 0x01       # ac_pwr: power (0/1)
 PARAM_MODE = 0x02        # ac_mode: 0=cool, 1=heat, 2=dry, 3=fan, 4=auto
 PARAM_TEMP = 0x03        # ac_temp: target temp (°C)
@@ -92,8 +94,9 @@ def build_control_payload(params: Dict[str, Any]) -> bytes:
     """
     payload = bytearray()
 
-    # Device ID (hex → 16 bytes). Cloud API returns 34-char DIDs (17 bytes);
-    # the wire protocol uses the last 16 bytes (32 hex chars).
+    # UNC-02: Cloud API returns 34-char DIDs.  We truncate to last 32 chars
+    # (16 bytes).  Verify with packet capture that this is the correct
+    # transformation.
     did_hex = params.get('did', '')
     if len(did_hex) > 32:
         did_hex = did_hex[-32:]
@@ -173,9 +176,8 @@ def parse_status_payload(data: bytes) -> Dict[str, Any]:
     while pos + 2 <= len(data):
         param_id = data[pos]
         param_len = data[pos + 1]
-        # A param_id of 0x00 with length 0x00 marks the start of the
-        # zero-padding region (NUL-fill to the AES block boundary).
-        # Stop here so we don't synthesize spurious param_0x00 entries.
+        # UNC-07: Assumes 0x00 0x00 sentinel marks end of param list.
+        # Verify with real device status response.
         if param_id == 0x00 and param_len == 0x00:
             break
         pos += 2

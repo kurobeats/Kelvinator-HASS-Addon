@@ -103,6 +103,8 @@ def _cloud_login_sync(
     Encryption: AES-128-CBC with ZeroBytePadding (NOT PKCS7).
     Key: MD5(timestamp + TIMESTAMP_SALT) per BLCommonTools.md5().
     Token: MD5(body_json + TOKEN_SALT).
+    UNC-11: Cloud login uses ZeroBytePadding; device UDP uses PKCS7.
+    These are different padding schemes for different contexts.
 
     Validated against decompiled SDK:
       - cn.com.broadlink.sdk.a.a() — HTTP post with AES encoding

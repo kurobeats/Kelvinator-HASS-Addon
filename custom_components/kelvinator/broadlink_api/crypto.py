@@ -21,10 +21,10 @@ from cryptography.hazmat.backends import default_backend
 class AESCipher:
     """AES-128-CBC cipher compatible with Broadlink devices.
 
-    Uses PKCS7 padding: each pad byte equals the number of pad bytes added.
-    Confirmed by Ghidra disassembly of libNetworkAPI.so bl_sdk_tfb_encode:
-      pad_byte_value = 0x10 - (data_len & 0xf)
-      if pad_byte_value == 0: pad_byte_value = 0x10
+    UNC-04: Uses PKCS7 padding for device UDP.  Confirmed by Ghidra
+    analysis of libNetworkAPI.so bl_sdk_tfb_encode, but that function may
+    only be used for cloud relay, not local UDP.  Verify padding by
+    capturing real device UDP traffic.
     """
 
     def __init__(self, key: bytes, iv: bytes = None):
