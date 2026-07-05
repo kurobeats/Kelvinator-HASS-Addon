@@ -252,34 +252,65 @@ def udp_status(ip: str, mac_str: str, did: str, aes_key_hex: str, password: int)
     build_control_payload = kd_proto.build_control_payload
     parse_status_payload = kd_proto.parse_status_payload
     AC_DEVTYPE = kd_proto.AC_DEVTYPE
+    default_key = bytes([0x09,0x76,0x28,0x34,0x3F,0xE9,0x9E,0x23,0x76,0x5C,0x15,0x13,0xAC,0xCF,0x8B,0x02])
 
     mac_bytes = bytes.fromhex(mac_str.replace(":", ""))
     aes_key = bytes.fromhex(aes_key_hex)
 
     # DID: cloud returns 34 chars, wire protocol uses last 32
     did_hex = did[-32:] if len(did) > 32 else did
-    print(f"  Connecting to {ip} (mac={mac_str}, did={did_hex[:8]}...)")
+    print(f"  Connecting to {ip} (mac={mac_str})")
+    print(f"  DID: {did_hex}")
+    print(f"  Cloud key: {aes_key.hex()}")
+
+    # Build auth payload directly to compare with pcap
+    auth_payload = bytearray(0x50)
+    auth_payload[0x04:0x14] = bytes([0x31] * 16)
+    auth_payload[0x1E] = 0x01
+    auth_payload[0x2D] = 0x01
+    auth_payload[0x30:0x36] = b"Test 1"
+    print(f"  Auth plaintext ({len(auth_payload)}B): {bytes(auth_payload).hex(' ')}")
+
+    # Build full auth packet to show raw bytes
+    auth_pkt = bl_proto.build_device_command(0, 0x4F9B, mac_bytes, default_key, 0x65, bytes(auth_payload), count=1)
+    print(f"  Auth packet ({len(auth_pkt)}B) header: {auth_pkt[:0x38].hex(' ')}")
 
     device = BroadlinkDevice(
         host=ip, mac=mac_bytes, device_type=AC_DEVTYPE,
         device_id=0, key=aes_key, timeout=5.0,
     )
 
-    # Auth
+    # Auth — try default key first (standard Broadlink), then cloud key directly
     try:
         device.auth()
-        print(f"  Auth OK: device_id=0x{device.device_id:08X}")
+        print(f"  Auth OK (default key): device_id=0x{device.device_id:08X}")
+        device.update_key(aes_key)
+        print(f"  Swapped to cloud key")
     except RuntimeError as e:
-        print(f"  Auth FAILED: {e}")
-        return None
-
-    # Swap to cloud key
-    device.update_key(aes_key)
+        print(f"  Auth with default key FAILED: {e}")
+        # Some devices may expect cloud key for auth — retry
+        print(f"  Retrying auth with cloud key directly...")
+        device2 = BroadlinkDevice(
+            host=ip, mac=mac_bytes, device_type=AC_DEVTYPE,
+            device_id=0, key=aes_key, timeout=5.0,
+        )
+        try:
+            device2.auth()
+            print(f"  Auth OK (cloud key): device_id=0x{device2.device_id:08X}")
+            # Already using cloud key
+        except RuntimeError as e2:
+            print(f"  Auth with cloud key also FAILED: {e2}")
+            print(f"  Both auth methods rejected. Possible causes:")
+            print(f"  - Device not on Wi-Fi or unreachable on port 80")
+            print(f"  - Device already paired to official app (try unpairing)")
+            print(f"  - Different default key for Kelvinator (not standard Broadlink)")
+            return None
+        device = device2
 
     # Status query
     params = {"did": did_hex, "sub_device_id": 0, "command_type": 0x02}
     payload = build_control_payload(params)
-    print(f"  Sending status query ({len(payload)}B)...")
+    print(f"  Status query plaintext ({len(payload)}B): {payload.hex(' ')}")
 
     try:
         result = device.send_command(payload)
