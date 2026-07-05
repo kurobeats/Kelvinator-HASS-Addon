@@ -1,0 +1,1 @@
+The app uses a native C library (dnaControl() in NetworkAPI.so) for encoding and sending device commands — there's no pure-HTTP command path. The private data API on bizpd stores cloud state but the actual AC control goes through the native DNA protocol. To send commands, you'd need to either reverse-engineer the DNA protocol or use the native library via Python FFI.
