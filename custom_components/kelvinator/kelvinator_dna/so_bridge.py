@@ -42,13 +42,13 @@ class NetworkAPI:
         "Java_cn_com_broadlink_networkapi_NetworkAPI_SDKInit":
             ([c_void_p, c_void_p, c_char_p], c_int),
         "Java_cn_com_broadlink_networkapi_NetworkAPI_dnaControl":
-            ([c_void_p, c_void_p, c_char_p, c_char_p, c_char_p, c_char_p, c_char_p], c_char_p),
+            ([c_void_p, c_void_p, c_char_p, c_char_p, c_char_p, c_char_p], c_char_p),
         "Java_cn_com_broadlink_networkapi_NetworkAPI_devicePair":
             ([c_void_p, c_void_p, c_char_p, c_char_p], c_int),
         "Java_cn_com_broadlink_networkapi_NetworkAPI_deviceProbe":
             ([c_void_p, c_void_p, c_char_p, c_char_p], c_char_p),
         "Java_cn_com_broadlink_networkapi_NetworkAPI_deviceStatusOnServer":
-            ([c_void_p, c_void_p, c_char_p], c_char_p),
+            ([c_void_p, c_void_p, c_char_p, c_char_p], c_char_p),
         "Java_cn_com_broadlink_networkapi_NetworkAPI_deviceSubControl":
             ([c_void_p, c_void_p, c_char_p, c_char_p, c_char_p, c_char_p], c_char_p),
         "Java_cn_com_broadlink_networkapi_NetworkAPI_deviceSubControlTranslate":
@@ -111,27 +111,25 @@ class NetworkAPI:
 
     def dna_control(
         self,
-        did: str,
-        mac: str,
-        aes_key: str,
-        password_or_cmd: str,
-        command_json: str,
+        dev_info: str,
+        sub_dev_info: str,
+        data: str,
+        cmd_desc: str,
     ) -> str:
         """
         Send a DNA control command to the device.
 
         This is the main function used by the app for device control.
 
-        Based on the JNI signature:
-          public native dnaControl(String did, String mac, String aesKey,
-                                    String password, String command) : String
+        Matches the JNI signature from the decompiled app:
+          NetworkAPI.dnaControl(String devInfo, String subDevInfo,
+                                String data, String cmdDesc)
 
         Args:
-            did: Device ID (hex string)
-            mac: MAC address (colon-separated)
-            aes_key: AES-128 key (hex string)
-            password_or_cmd: Device password or sub-command identifier
-            command_json: JSON command parameters
+            dev_info: JSON device info (DID, MAC, etc.)
+            sub_dev_info: JSON sub-device info or empty string
+            data: JSON control command parameters
+            cmd_desc: Command type identifier (e.g. "dev_ctrl")
 
         Returns:
             JSON response string
@@ -140,11 +138,10 @@ class NetworkAPI:
         result = func(
             c_void_p(0),          # JNIEnv*
             c_void_p(0),          # jclass
-            did.encode('utf-8'),
-            mac.encode('utf-8'),
-            aes_key.encode('utf-8'),
-            password_or_cmd.encode('utf-8'),
-            command_json.encode('utf-8'),
+            dev_info.encode('utf-8'),
+            sub_dev_info.encode('utf-8'),
+            data.encode('utf-8'),
+            cmd_desc.encode('utf-8'),
         )
         # Result is a jstring — ctypes returns a char* for us
         if result:
@@ -176,10 +173,13 @@ class NetworkAPI:
             return result.decode('utf-8')
         return ""
 
-    def device_status_on_server(self, config: str) -> str:
-        """Get device status via cloud server."""
+    def device_status_on_server(self, config: str, did: str = "") -> str:
+        """Get device status via cloud server.
+
+        Matches JNI signature: deviceStatusOnServer(String config, String did)
+        """
         func = self._lib.Java_cn_com_broadlink_networkapi_NetworkAPI_deviceStatusOnServer
-        result = func(c_void_p(0), c_void_p(0), config.encode('utf-8'))
+        result = func(c_void_p(0), c_void_p(0), config.encode('utf-8'), did.encode('utf-8'))
         if result:
             return result.decode('utf-8')
         return ""

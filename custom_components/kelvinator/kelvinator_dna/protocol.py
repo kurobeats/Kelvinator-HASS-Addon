@@ -34,9 +34,9 @@ AC_DEVTYPE = 0x4F9B  # 20379
 # These IDs come from the decompiled libNetworkAPI.so binary.
 # The app-level names (from HAR telemetry) are shown in comments for reference.
 PARAM_POWER = 0x01       # ac_pwr: power (0/1)
-PARAM_MODE = 0x02        # ac_mode: 0=cool, 1=heat, 2=auto, 3=fan, 4=dry
+PARAM_MODE = 0x02        # ac_mode: 0=cool, 1=heat, 2=dry, 3=fan, 4=auto
 PARAM_TEMP = 0x03        # ac_temp: target temp (°C)
-PARAM_FAN = 0x04         # ac_mark: fan speed (0=auto, 1=low, 2=med, 3=high, 5=turbo)
+PARAM_FAN = 0x04         # ac_mark: fan speed (0=auto, 1=low, 2=med, 3=high, 4=turbo, 5=quiet, 6=low_med, 7=med_high)
 PARAM_SWING = 0x05       # ac_vdir: swing (0=off, 1=vert, 2=horiz, 3=both)
 PARAM_SLEEP = 0x06       # ac_slp: sleep (0/1)
 PARAM_TURBO = 0x07       # (dedicated turbo toggle; may be unused — turbo is a fan level)
@@ -81,9 +81,9 @@ def build_control_payload(params: Dict[str, Any]) -> bytes:
             sub_device_id: int — Sub-device index (0 for main unit)
             command_type: int — 1=set control, 2=query status
             power: bool
-            mode: int (0=cool, 1=heat, 2=auto, 3=fan, 4=dry)
+            mode: int (0=cool, 1=heat, 2=dry, 3=fan, 4=auto)
             temp: int (Celsius, 16-30)
-            fan: int (0=auto, 1=low, 2=med, 3=high, 5=turbo)
+            fan: int (0=auto, 1=low, 2=med, 3=high, 4=turbo, 5=quiet, 6=low_med, 7=med_high)
             swing: int (0=off, 1=vert, 2=horiz, 3=both)
             sleep: bool
             turbo: bool
@@ -92,10 +92,14 @@ def build_control_payload(params: Dict[str, Any]) -> bytes:
     """
     payload = bytearray()
 
-    # Device ID (hex → 16 bytes; HAR-confirmed DID is 32 hex chars = 16 bytes)
-    did = bytes.fromhex(params.get('did', ''))
+    # Device ID (hex → 16 bytes). Cloud API returns 34-char DIDs (17 bytes);
+    # the wire protocol uses the last 16 bytes (32 hex chars).
+    did_hex = params.get('did', '')
+    if len(did_hex) > 32:
+        did_hex = did_hex[-32:]
+    did = bytes.fromhex(did_hex)
     if len(did) != 16:
-        raise ValueError(f"DID must be 16 bytes (32 hex chars), got {len(did)}")
+        raise ValueError(f"DID must be 16 bytes (32 hex chars), got {len(did)} from {params.get('did', '')}")
     payload.extend(did)
 
     # Sub-device ID (2 bytes LE)

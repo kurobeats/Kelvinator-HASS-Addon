@@ -73,7 +73,7 @@ class CloudDeviceInfo:
 class AcDeviceState:
     """Full state of a Kelvinator AC unit, normalized for HA."""
     power: bool = False
-    mode: int = 0       # 0=cool, 1=heat, 2=auto, 3=fan, 4=dry
+    mode: int = 0       # 0=cool, 1=heat, 2=dry, 3=fan, 4=auto
     target_temp: int = 24
     fan: int = 0        # 0=auto, 1=low, 2=med, 3=high
     swing: int = 0      # 0=off, 1=vert, 2=horiz, 3=both
@@ -197,7 +197,7 @@ class KelvinatorCloudClient:
         )
         self._userid = user_id
         self._loginsession = login_session
-        _LOGGER.info("Cloud login OK (uid=%s)", user_id)
+        _LOGGER.debug("Cloud login OK (uid=%s)", user_id[:8] + "...")
 
     async def discover_devices(self) -> list[CloudDeviceInfo]:
         """Discover all AC devices linked to this account."""
@@ -236,11 +236,19 @@ class DNACloudRelay:
         self,
         did: str, mac: str, aes_key: str, password: int, command_json: str,
     ) -> dict:
-        result = self._api.dna_control(did, mac, aes_key, str(password), command_json)
+        # Build dev_info JSON matching the native dnaControl(JNI) signature:
+        #   (String devInfo, String subDevInfo, String data, String cmdDesc)
+        dev_info = _json.dumps({
+            "did": did, "mac": mac,
+            "aes_key": aes_key, "password": password,
+        }, separators=(",", ":"))
+        result = self._api.dna_control(
+            dev_info, "", command_json, "dev_ctrl",
+        )
         return _json.loads(result)
 
     def get_status(self, config_json: str) -> dict:
-        result = self._api.device_status_on_server(config_json)
+        result = self._api.device_status_on_server(config_json, did="")
         return _json.loads(result)
 
 
@@ -315,6 +323,9 @@ class KelvinatorACDevice:
     async def update_state(self) -> bool:
         if self._relay is None:
             return True
+        if isinstance(self._relay, DNALocalRelay):
+            self.available = False
+            return False
         try:
             config = _json.dumps({
                 "did": self.did,
@@ -333,6 +344,8 @@ class KelvinatorACDevice:
                 self.state.error_code = int(data.get("ac_errcode", 0))
                 self.state.swing = data.get("ac_vdir", 0)
                 self.state.sleep = bool(data.get("ac_slp", 0))
+                self.state.display_on = bool(data.get("scrdisp", 1))
+                self.state.eco = bool(data.get("ecomode", 0))
                 self.available = True
                 return True
         except Exception as exc:

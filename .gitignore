@@ -218,3 +218,7 @@ __marimo__/
 
 # Test scrips
 tests/
+
+# pi dev things
+.pi/
+.pi-subagents/

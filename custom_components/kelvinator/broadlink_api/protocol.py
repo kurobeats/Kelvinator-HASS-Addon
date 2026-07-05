@@ -28,7 +28,7 @@ Broadlink device packet structure (0x38-byte header + variable payload):
 Encryption:
   - AES-128-CBC with a hardcoded IV (562e17996d093d28ddb3ba695a2e6f58)
   - Key: either the BroadLink default key or the per-device cloud key
-  - Padding: zero bytes (NOT PKCS7)
+  - Padding: PKCS7 (confirmed by Ghidra analysis of libNetworkAPI.so bl_sdk_tfb_encode)
   - Payload checksum is computed BEFORE encryption
   - Header checksum covers header fields only (before appending encrypted payload)
 
@@ -113,9 +113,11 @@ def build_device_command(
     p_checksum = (sum(payload, 0xBEAF)) & 0xFFFF
     struct.pack_into("<H", header, 0x34, p_checksum)
 
-    # Encrypt payload with zero-padding
-    padding_len = (16 - (len(payload) % 16)) % 16
-    padded = payload + bytes(padding_len)
+    # Encrypt payload with PKCS7 padding (confirmed by Ghidra SO analysis)
+    pad_len = 16 - (len(payload) % 16)
+    if pad_len == 0:
+        pad_len = 16
+    padded = payload + bytes([pad_len] * pad_len)
     cipher = AESCipher(device_key, iv=AES_IV)
     encrypted_payload = cipher.encrypt(padded)
 
@@ -179,8 +181,17 @@ def parse_device_response(
     # Decrypt the payload
     cipher = AESCipher(device_key, iv=AES_IV)
     decrypted = cipher.decrypt(encrypted_payload)
-    # Strip zero-padding
-    payload = decrypted.rstrip(b'\x00')
+    # Strip PKCS7 padding (confirmed by Ghidra SO analysis)
+    if not decrypted:
+        payload = decrypted
+    else:
+        pad_len = decrypted[-1]
+        if pad_len < 1 or pad_len > 16:
+            payload = decrypted  # fallback: don't strip if invalid
+        elif decrypted[-pad_len:] != bytes([pad_len] * pad_len):
+            payload = decrypted  # fallback: invalid padding
+        else:
+            payload = decrypted[:-pad_len]
 
     return {
         "device_id": dev_id,

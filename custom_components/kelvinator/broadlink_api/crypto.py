@@ -5,7 +5,9 @@ Provides AES-128-CBC encryption/decryption compatible with Broadlink devices.
 
 Matches the python-broadlink library's implementation:
 - AES-128-CBC with a hardcoded IV (562e17996d093d28ddb3ba695a2e6f58)
-- Zero-padding (NOT PKCS7)
+- PKCS7 padding (pad-byte value = number of pad bytes)
+  Confirmed via Ghidra analysis of libNetworkAPI.so: bl_sdk_tfb_encode
+  uses PKCS7 padding.
 - No checksum inside the ciphertext (checksum is in the protocol header)
 """
 
@@ -19,8 +21,10 @@ from cryptography.hazmat.backends import default_backend
 class AESCipher:
     """AES-128-CBC cipher compatible with Broadlink devices.
 
-    Uses zero-padding (NUL bytes) to align to 16-byte AES block boundary.
-    This is what the real python-broadlink library does.
+    Uses PKCS7 padding: each pad byte equals the number of pad bytes added.
+    Confirmed by Ghidra disassembly of libNetworkAPI.so bl_sdk_tfb_encode:
+      pad_byte_value = 0x10 - (data_len & 0xf)
+      if pad_byte_value == 0: pad_byte_value = 0x10
     """
 
     def __init__(self, key: bytes, iv: bytes = None):
@@ -74,15 +78,13 @@ def broadlink_encrypt(payload: bytes, key: bytes, iv: bytes = None) -> bytes:
     """
     Encrypt a payload using the Broadlink device encryption scheme.
 
-    This is a convenience wrapper used by the BroadlinkDevice class.
-    It zero-pads, then encrypts.
-
-    NOTE: The checksum is NOT embedded in the ciphertext with this scheme.
-    The checksum lives in the protocol header at offset 0x34.
+    PKCS7-pads to 16-byte boundary, then AES-128-CBC encrypts.
     """
-    # Zero-pad to 16-byte boundary (matching python-broadlink send_packet)
-    padding_len = (16 - (len(payload) % 16)) % 16
-    padded = payload + bytes(padding_len)
+    # PKCS7 padding: pad byte value = number of pad bytes needed
+    pad_len = 16 - (len(payload) % 16)
+    if pad_len == 0:
+        pad_len = 16
+    padded = payload + bytes([pad_len] * pad_len)
     return AESCipher(key, iv).encrypt(padded)
 
 
@@ -90,11 +92,19 @@ def broadlink_decrypt(encrypted: bytes, key: bytes, iv: bytes = None) -> bytes:
     """
     Decrypt a Broadlink device payload.
 
-    Decrypts and strips trailing zero-padding.
+    Decrypts and strips PKCS7 padding.
     """
     plain = AESCipher(key, iv).decrypt(encrypted)
-    # Strip zero-padding (the device uses NUL bytes, not PKCS7)
-    return plain.rstrip(b'\x00')
+    # Strip PKCS7 padding: last byte = pad count
+    if not plain:
+        return plain
+    pad_len = plain[-1]
+    if pad_len < 1 or pad_len > 16:
+        raise ValueError(f"Invalid PKCS7 padding byte: {pad_len}")
+    # Verify all pad bytes match
+    if plain[-pad_len:] != bytes([pad_len] * pad_len):
+        raise ValueError("Invalid PKCS7 padding")
+    return plain[:-pad_len]
 
 
 def derive_device_key(device_id: int, key: bytes) -> bytes:

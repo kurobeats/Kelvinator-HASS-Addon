@@ -60,9 +60,9 @@ DISCOVERY_PORT = 80
 class DeviceStatus:
     """Current state of the AC unit."""
     power: bool = False
-    mode: int = 0           # 0=cool, 1=heat, 2=auto, 3=fan, 4=dry
+    mode: int = 0           # 0=cool, 1=heat, 2=dry, 3=fan, 4=auto
     temp: int = 24
-    fan: int = 0            # 0=auto, 1=low, 2=med, 3=high, 5=turbo
+    fan: int = 0            # 0=auto, 1=low, 2=med, 3=high, 4=turbo, 5=quiet, 6=low_med, 7=med_high
     swing: int = 0          # 0=off, 1=vert, 2=horiz, 3=both
     sleep: bool = False
     turbo: bool = False
@@ -72,8 +72,8 @@ class DeviceStatus:
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def __repr__(self) -> str:
-        mode_names = {0: "COOL", 1: "HEAT", 2: "AUTO", 3: "FAN", 4: "DRY"}
-        fan_names = {0: "AUTO", 1: "LOW", 2: "MED", 3: "HIGH", 5: "TURBO"}
+        mode_names = {0: "COOL", 1: "HEAT", 2: "DRY", 3: "FAN", 4: "AUTO"}
+        fan_names = {0: "AUTO", 1: "LOW", 2: "MED", 3: "HIGH", 4: "TURBO", 5: "QUIET", 6: "LOW_MED", 7: "MED_HIGH"}
         swing_names = {0: "OFF", 1: "VERT", 2: "HORIZ", 3: "BOTH"}
 
         parts = [

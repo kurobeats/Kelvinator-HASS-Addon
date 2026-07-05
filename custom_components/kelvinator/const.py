@@ -29,14 +29,8 @@ TIMESTAMP_SALT = "kdixkdqp54545^#*"
 PASSWORD_SALT = "4969fj#k23#"
 DEFAULT_LICENSE_ID = "bddb4af53f74edaa03b1aa439b75e7a6"
 
-# Full base64 License from AirApplication.java — bytes 120:136 = companyid
-FULL_LICENSE = (
-    "vdtK9T907aoDsapDm3Xnpviv67CfTNVaCnBaVHLbiTo0j+/RvjQpBrWd6wi3wqkc"
-    "5OkMWgAAAACYJzsfBji8eBl5PVjaBV0221pCDlvjSasStCYcZJK9YB8Ze5skOd3JxQ"
-    "artvnM1yncOPqd/5kKHxJ0Y7b4U5AFg/vh4BVg6qjaYHnfiJKkvAAAAAA="
-)
-import base64
-COMPANY_ID = base64.b64decode(FULL_LICENSE)[120:136].hex()
+# Company ID extracted from AirApplication.java license (bytes 120:136)
+COMPANY_ID = "98273b1f0638bc7819793d58da055d36"
 
 # ---------------------------------------------------------------------------
 # Kelvinator AC mode constants (from ACCommonUtils.java)

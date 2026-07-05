@@ -109,13 +109,13 @@ class KelvinatorSwitch(SwitchEntity):
             await self._device.send_command({"power": 1 if on else 0})
             s.power = on
         elif key == "display":
-            await self._device.send_command({"display": 1 if on else 0})
+            await self._device.send_command({"scrdisp": 1 if on else 0})
             s.display_on = on
         elif key == "sleep":
             await self._device.send_command({"sleep": 1 if on else 0})
             s.sleep = on
         elif key == "eco":
-            await self._device.send_command({"eco": 1 if on else 0})
+            await self._device.send_command({"ecomode": 1 if on else 0})
             s.eco = on
         self.async_write_ha_state()
 

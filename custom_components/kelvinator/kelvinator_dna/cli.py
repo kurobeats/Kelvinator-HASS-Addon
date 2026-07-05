@@ -125,7 +125,7 @@ def cmd_control(args: argparse.Namespace) -> None:
     elif args.power_off:
         params['power'] = False
     if args.mode:
-        mode_map = {'cool': 0, 'heat': 1, 'auto': 2, 'fan': 3, 'dry': 4}
+        mode_map = {'cool': 0, 'heat': 1, 'dry': 2, 'fan': 3, 'auto': 4}
         params['mode'] = mode_map[args.mode]
     if args.temp is not None:
         params['temp'] = args.temp
@@ -172,7 +172,7 @@ def main() -> None:
     p.add_argument('-i', '--ip')
     p.add_argument('--power-on', action='store_true')
     p.add_argument('--power-off', action='store_true')
-    p.add_argument('--mode', choices=['cool', 'heat', 'auto', 'fan', 'dry'])
+    p.add_argument('--mode', choices=['cool', 'heat', 'dry', 'fan', 'auto'])
     p.add_argument('--temp', type=int)
     p.add_argument('--fan', choices=['auto', 'low', 'med', 'high'])
     p.add_argument('--swing', choices=['off', 'vert', 'horiz', 'both'])

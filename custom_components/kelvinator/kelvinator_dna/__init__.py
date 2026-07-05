@@ -17,7 +17,7 @@ Architecture:
 
 Protocol details:
   - Broadlink DNA header: 56 bytes (0x38) with device type, ID, MAC, timestamp
-  - Encryption: AES-128-CBC with PKCS7 padding
+  - Encryption: AES-128-CBC with PKCS7 padding (confirmed by Ghidra SO analysis)
   - IV derivation: MD5(device_key + device_id_as_u32_le)
   - Checksum: 2-byte little-endian sum prepended before encryption
   - AC payload: TFB blocks [param_id:1][len:1][val:N] inside decrypted envelope

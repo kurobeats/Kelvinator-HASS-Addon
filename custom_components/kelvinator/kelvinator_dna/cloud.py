@@ -90,7 +90,9 @@ class KelvinatorCloud:
             print(f"{dev.name}: {dev.mac}, AES key: {dev.aes_key}")
     """
 
-    API_HOST = "bddb4af53f74edaa03b1aa439b75e7a6bizihcv0.ibroadlink.com"
+    @property
+    def API_HOST(self) -> str:
+        return f"{self.credentials.license_id}bizihcv0.ibroadlink.com"
 
     def __init__(
         self,
@@ -143,8 +145,6 @@ class KelvinatorCloud:
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
 
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
 
         try:
             with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:

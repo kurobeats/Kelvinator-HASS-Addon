@@ -8,26 +8,34 @@ from enum import IntEnum
 
 
 class ACMode(IntEnum):
-    """Air conditioner operation modes."""
+    """Air conditioner operation modes.
+
+    Values match ACCommonUtils.java from the decompiled app.
+    """
     COOL = 0
     HEAT = 1
-    AUTO = 2
+    DRY = 2
     FAN = 3
-    DRY = 4
+    AUTO = 4
+    ECO = 5
+    EIGHT_HEAT = 6
+    TWELVE_HEAT = 7
 
 
 class FanSpeed(IntEnum):
-    """Fan speed settings (verified against HAR telemetry).
+    """Fan speed settings.
 
-    The Kelvinator app uses the internal name ``ac_mark`` for fan speed.
-    Values 0-3 are standard speeds; 5 is the TURBO / maximum-speed mode.
-    (Value 4 is skipped in the real app.)
+    Values match DevConstants.java and ACCommonUtils.java from the decompiled
+    Kelvinator app.  The app uses the internal name ``ac_mark`` for fan speed.
     """
     AUTO = 0
     LOW = 1
     MEDIUM = 2
     HIGH = 3
-    TURBO = 5
+    TURBO = 4
+    QUIET = 5
+    LOW_MED = 6
+    MED_HIGH = 7
 
 
 class SwingMode(IntEnum):
@@ -93,8 +101,8 @@ class ACState:
         )
 
     def __repr__(self) -> str:
-        mode_names = {0: "COOL", 1: "HEAT", 2: "AUTO", 3: "FAN", 4: "DRY"}
-        fan_names = {0: "AUTO", 1: "LOW", 2: "MED", 3: "HIGH", 5: "TURBO"}
+        mode_names = {0: "COOL", 1: "HEAT", 2: "DRY", 3: "FAN", 4: "AUTO", 5: "ECO", 6: "EIGHT_HEAT", 7: "TWELVE_HEAT"}
+        fan_names = {0: "AUTO", 1: "LOW", 2: "MED", 3: "HIGH", 4: "TURBO", 5: "QUIET", 6: "LOW_MED", 7: "MED_HIGH"}
         swing_names = {0: "OFF", 1: "VERT", 2: "HORIZ", 3: "BOTH"}
 
         parts = [
