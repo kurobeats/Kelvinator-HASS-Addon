@@ -1,9 +1,10 @@
 """
 Kelvinator Home Comfort — API layer.
 
-Uses the bundled kelvinator_dna package for:
-  - Cloud device discovery (HTTPS REST API via kelvinator_dna.cloud)
-  - DNA protocol control (UDP or cloud relay via libNetworkAPI.so)
+Cloud (HTTPS REST, kelvinator_dna.cloud) for login + device discovery with
+AES keys.  Control/status goes through the bundled BroadLink DNA SDK
+native bridge (dna_native.py → dna_sdk/) using the SDK's own script-driven
+protocol (DNA Kit Lua scripts), matching the official app.
 """
 
 from __future__ import annotations
@@ -12,43 +13,34 @@ import asyncio
 import hashlib
 import json as _json
 import logging
-import os
 import re
-import socket
-import struct
-import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from .const import DEFAULT_LICENSE_ID, COMPANY_ID, AES_IV, PASSWORD_SALT, TIMESTAMP_SALT, TOKEN_SALT
+from .dna_native import NativeDNAClient, NativeDNAError
 
 _LOGGER = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Try to locate libNetworkAPI.so for cloud relay
-# ---------------------------------------------------------------------------
+# DNA Kit parameter names (from the decrypted 9b4f0000 DNA Kit Lua script).
+# These are STRING names on the wire (JSON body), not binary IDs.
+DNA_PARAMS_STATUS = [
+    "ac_pwr", "ac_mode", "temp", "ac_mark", "ac_vdir", "ac_slp",
+    "scrdisp", "ecomode", "envtemp", "ac_errcode",
+]
 
-_SO_DIR = os.path.dirname(os.path.abspath(__file__))
-_SO_PATH = os.environ.get(
-    "KELVINATOR_SO_PATH",
-    os.path.join(_SO_DIR, "libNetworkAPI.so"),
-)
-
-# Unlike _SO_AVAILABLE (which only checks os.path.exists), this tests
-# whether the SO can *actually* be loaded.  The SO is an Android ARM
-# binary that depends on NDK libraries (liblog.so, etc.) which are not
-# present on standard Linux / Home Assistant systems.  If the file
-# exists but ctypes.CDLL fails, _SO_LOAD_ERROR contains the reason.
-_SO_AVAILABLE = os.path.exists(_SO_PATH)
-_SO_LOAD_ERROR: Optional[str] = None
-
-if _SO_AVAILABLE:
-    try:
-        import ctypes
-        ctypes.CDLL(_SO_PATH)
-    except Exception as exc:
-        _SO_LOAD_ERROR = str(exc)
+# HA-side shortcut → DNA param name
+_PARAM_MAP = {
+    "power": "ac_pwr",
+    "mode": "ac_mode",
+    "temp": "temp",
+    "fan": "ac_mark",
+    "vdir": "ac_vdir",
+    "sleep": "ac_slp",
+    "scrdisp": "scrdisp",
+    "ecomode": "ecomode",
+}
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -100,8 +92,8 @@ def _cloud_login_sync(
     """Blocking cloud login matching the official app SDK.
 
     Password: SHA1(SHA256(password + PASSWORD_SALT)) per BLCommonTools.SHA1().
-    Encryption: AES-128-CBC.  Server accepts both PKCS7 and ZeroBytePadding;
-    the official app uses ZeroBytePadding but PKCS7 works (verified working).
+    Encryption: AES-128-CBC with PKCS7 padding (deliberate revert; verified
+    working against the live server — see git history aa2cc77).
     Key: MD5(timestamp + TIMESTAMP_SALT) per BLCommonTools.md5().
     Token: MD5(body_json + TOKEN_SALT).
 
@@ -126,7 +118,6 @@ def _cloud_login_sync(
     aes_key = bytes.fromhex(hashlib.md5(
         (ts + TIMESTAMP_SALT).encode()
     ).hexdigest().lower())
-    cipher = AES.new(aes_key, AES.MODE_CBC, iv=AES_IV)
     cipher = AES.new(aes_key, AES.MODE_CBC, iv=AES_IV)
     encrypted = cipher.encrypt(pad(body.encode(), AES.block_size))
     token = hashlib.md5(body.encode() + TOKEN_SALT.encode()).hexdigest().lower()
@@ -229,95 +220,36 @@ class KelvinatorCloudClient:
     def userid(self) -> Optional[str]:
         return self._userid
 
+    async def sdk_auth_params(self) -> Optional[list[str]]:
+        """Fetch the API key + timestamp needed for the native SDKAuth call."""
+        from .kelvinator_dna.cloud import KelvinatorCloud
 
-# ---------------------------------------------------------------------------
-# DNA cloud relay
-# ---------------------------------------------------------------------------
-
-
-class DNACloudRelay:
-    """Cloud relay control using libNetworkAPI.so via kelvinator_dna.so_bridge."""
-
-    def __init__(self, so_path: str = _SO_PATH) -> None:
-        if not _SO_AVAILABLE:
-            raise RuntimeError(f"libNetworkAPI.so not found at {so_path}")
-        from .kelvinator_dna.so_bridge import NetworkAPI
-        self._api = NetworkAPI(so_path)
-        self._api.sdk_init("{}")
-
-    def send_command(
-        self,
-        did: str, mac: str, aes_key: str, password: int, command_json: str,
-    ) -> dict:
-        # Build dev_info JSON matching the native dnaControl(JNI) signature:
-        #   (String devInfo, String subDevInfo, String data, String cmdDesc)
-        dev_info = _json.dumps({
-            "did": did, "mac": mac,
-            "aes_key": aes_key, "password": password,
-        }, separators=(",", ":"))
-        result = self._api.dna_control(
-            dev_info, "", command_json, "dev_ctrl",
+        cloud = KelvinatorCloud(
+            license_id=self._license_id,
+            user_id=self._userid or "",
+            login_session=self._loginsession or "",
+            language=self._language,
         )
-        return _json.loads(result)
-
-    def get_status(self, config_json: str) -> dict:
-        result = self._api.device_status_on_server(config_json, did="")
-        return _json.loads(result)
-
-
-class DNALocalRelay:
-    """
-    No-op fallback when local/cloud control is unavailable.
-
-    Logs a single WARNING-level message explaining *why* control is
-    unavailable (SO not found, SO cannot load, etc.) and returns
-    failure responses so the integration marks the device as
-    unavailable instead of spamming error logs.
-    """
-
-    def __init__(self, reason: str = "libNetworkAPI.so not found") -> None:
-        self._reason = reason
-        self._warned: bool = False
-
-    def _warn_once(self) -> None:
-        if self._warned:
-            return
-        self._warned = True
-        _LOGGER.warning(
-            "Cloud relay is unavailable (%s). "
-            "Local UDP control requires libNetworkAPI.so which is an Android "
-            "ARM binary and will not load on standard Linux / Home Assistant "
-            "systems.  Device status and commands are disabled.",
-            self._reason,
-        )
-
-    def send_command(
-        self,
-        did: str, mac: str, aes_key: str, password: int, command_json: str,
-    ) -> dict:
-        self._warn_once()
-        return {"status": -1, "message": "Cloud relay unavailable"}
-
-    def get_status(self, config_json: str) -> dict:
-        self._warn_once()
-        return {"status": -1, "message": "Cloud relay unavailable"}
+        try:
+            api_key = await asyncio.to_thread(cloud.authenticate)
+        except Exception as exc:
+            _LOGGER.warning("Could not obtain API key for SDKAuth: %s", exc)
+            return None
+        ts = str(cloud.credentials.server_timestamp or int(time.time()))
+        return [api_key, ts]
 
 
 # ---------------------------------------------------------------------------
-# Device wrapper
+# DNA SDK native bridge control
 # ---------------------------------------------------------------------------
 
 
 class KelvinatorACDevice:
-    """Kelvinator AC unit controlled via kelvinator_dna (cloud relay or local UDP)."""
+    """Kelvinator AC unit controlled via the bundled DNA SDK native bridge."""
 
-    def __init__(
-        self,
-        info: CloudDeviceInfo,
-        relay: Optional[DNACloudRelay] = None,
-    ) -> None:
+    def __init__(self, info: CloudDeviceInfo, client: Optional[NativeDNAClient] = None) -> None:
         self.info = info
-        self._relay = relay
+        self._client = client
         self.state = AcDeviceState()
         self.available = True
 
@@ -333,76 +265,83 @@ class KelvinatorACDevice:
     def did(self) -> str:
         return self.info.did
 
+    def _dev_dict(self) -> dict[str, Any]:
+        return {
+            "did": self.info.did,
+            "mac": self.info.mac.replace(":", ""),
+            "aes_key": self.info.aes_key,
+            "password": self.info.password,
+            "pid": self.info.pid,
+            "devtype": self.info.devtype,
+            "magiccode": self.info.pid or "9b4f0000",
+            "ip": getattr(self, "_ip", "") or "",
+            "port": 80,
+        }
+
     async def update_state(self) -> bool:
-        if self._relay is None:
-            return True
-        if isinstance(self._relay, DNALocalRelay):
-            self.available = False
+        if self._client is None:
             return False
         try:
-            config = _json.dumps({
-                "did": self.did,
-                "mac": self.mac,
-                "aes_key": self.info.aes_key,
-                "password": self.info.password,
-            })
-            result = await asyncio.to_thread(self._relay.get_status, config)
-            if result.get("status") == 0:
-                data = result.get("data", {})
-                self.state.power = bool(data.get("ac_pwr", 0))
-                self.state.mode = data.get("ac_mode", 0)
-                self.state.target_temp = data.get("temp", 24)
-                self.state.fan = data.get("ac_mark", 0)
-                self.state.ambient_temp = float(data.get("envtemp", 0))
-                self.state.error_code = int(data.get("ac_errcode", 0))
-                self.state.swing = data.get("ac_vdir", 0)
-                self.state.sleep = bool(data.get("ac_slp", 0))
-                self.state.display_on = bool(data.get("scrdisp", 1))
-                self.state.eco = bool(data.get("ecomode", 0))
-                self.available = True
-                return True
-        except Exception as exc:
+            dev = self._dev_dict()
+            vals = [[{"val": 0}] for _ in DNA_PARAMS_STATUS]
+            resp = await self._client.device_request(dev, "get", DNA_PARAMS_STATUS, vals)
+            data = resp.get("data") or {}
+            recv = data.get("recvData")
+            values: dict[str, Any] = {}
+            if recv:
+                import base64
+                body = _json.loads(base64.b64decode(recv))
+                values = body if isinstance(body, dict) else {}
+            elif data.get("params"):
+                # some SDK versions return parsed params directly
+                values = dict(zip(data["params"],
+                                  [v[0]["val"] for v in data.get("vals", [])]))
+            else:
+                _LOGGER.warning(
+                    "Status query for %s returned no data: %s — DNA SDK auth "
+                    "(SDKAuth) may be required (control key expired)",
+                    self.name, resp)
+                self.available = False
+                return False
+            self.state.power = bool(values.get("ac_pwr", 0))
+            self.state.mode = int(values.get("ac_mode", 0))
+            self.state.target_temp = int(values.get("temp", 24))
+            self.state.fan = int(values.get("ac_mark", 0))
+            self.state.swing = int(values.get("ac_vdir", 0))
+            self.state.sleep = bool(values.get("ac_slp", 0))
+            self.state.display_on = bool(values.get("scrdisp", 1))
+            self.state.eco = bool(values.get("ecomode", 0))
+            self.state.ambient_temp = float(values.get("envtemp", 0))
+            self.state.error_code = int(values.get("ac_errcode", 0))
+            self.available = True
+            return True
+        except NativeDNAError as exc:
             _LOGGER.warning("Status query failed for %s: %s", self.name, exc)
+            self.available = False
+        except Exception as exc:
+            _LOGGER.warning("Status query error for %s: %s", self.name, exc)
             self.available = False
         return False
 
     async def send_command(self, params: dict) -> bool:
-        if self._relay is None:
-            _LOGGER.warning("No cloud relay available for %s", self.name)
+        if self._client is None:
+            _LOGGER.warning("No DNA SDK bridge available for %s", self.name)
             return False
         try:
-            cmd = _json.dumps({"did": self.did, "params": params})
-            result = await asyncio.to_thread(
-                self._relay.send_command,
-                did=self.did, mac=self.mac,
-                aes_key=self.info.aes_key, password=self.info.password,
-                command_json=cmd,
-            )
-            return result.get("status") == 0
-        except Exception as exc:
+            names = [_PARAM_MAP.get(k, k) for k in params]
+            vals = [[{"val": v}] for v in params.values()]
+            dev = self._dev_dict()
+            resp = await self._client.device_request(dev, "set", names, vals)
+            ok = resp.get("status") == 0
+            if not ok:
+                _LOGGER.warning("Command rejected for %s: %s", self.name, resp)
+            self.available = ok
+            return ok
+        except NativeDNAError as exc:
             _LOGGER.error("Command failed for %s: %s", self.name, exc)
+            self.available = False
             return False
 
 
 # Backward compatibility alias
 CloudACDevice = KelvinatorACDevice
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def get_dna_relay() -> Optional[DNACloudRelay | DNALocalRelay]:
-    """Get the DNA relay — cloud relay preferred, local UDP as fallback."""
-    if _SO_LOAD_ERROR is not None:
-        # SO file exists but cannot load (e.g. missing liblog.so —
-        # it's an Android ARM binary).  Don't bother retrying.
-        _LOGGER.info("libNetworkAPI.so found but cannot load: %s", _SO_LOAD_ERROR)
-        return DNALocalRelay(reason=_SO_LOAD_ERROR)
-
-    if _SO_AVAILABLE:
-        return DNACloudRelay()
-
-    _LOGGER.info("libNetworkAPI.so not found — cloud relay unavailable")
-    return DNALocalRelay(reason="libNetworkAPI.so not found")

@@ -13,7 +13,7 @@ Home Assistant integration for controlling Kelvinator/Electrolux air conditioner
 - **Switch entities** — Per-AC toggles for power, display, sleep, and ECO modes
 - **Sensor entities** — Ambient temperature and error code per device
 - **Single-step setup** — Enter your Kelvinator app username and password; devices are auto-discovered from your cloud account
-- **Self-contained** — The reverse-engineered protocol library is bundled directly in the integration; no unpublished dependencies
+- **Vendor SDK control** — Device control/status runs through the official BroadLink DNA SDK (`libNetworkAPI.so`) shipped inside this integration, using the same DNA Kit protocol scripts as the Kelvinator mobile app
 
 ## Supported Devices
 
@@ -26,9 +26,22 @@ Home Assistant integration for controlling Kelvinator/Electrolux air conditioner
 |---|---|
 | Kelvinator cloud account | Same email/phone and password used in the mobile app |
 | Home Assistant 2024.1+ | Integration framework |
+| **x86-64 Linux** | The bundled DNA SDK binary is an x86-64 Android-NDK build; other architectures are not supported yet |
 | `pycryptodome` ≥ 3.19.0 | AES encryption for cloud login (installed automatically) |
 
-The `kelvinator_dna` protocol library is **bundled** in this integration — no extra pip packages or unpublished dependencies needed.
+## How Control Works
+
+These ACs are **locked** BroadLink DNA devices. They reject the classic
+local UDP auth handshake (errno -7, "control key is expired") — even the
+official app does this — and require a cloud-issued control key via the
+DNA SDK's `SDKAuth` (TLS + ECDH) flow. This integration therefore uses
+the vendor's own SDK binary for the auth/control path:
+
+1. **Login** — Authenticates against `bizaccount.ibroadlink.com` using AES-128-CBC encrypted credentials (matching the mobile app's login flow)
+2. **Discovery** — Retrieves device list, AES keys, and passwords from `bizihcv0.ibroadlink.com` via the bundled `kelvinator_dna.cloud` module
+3. **DNA SDK init** — Starts the bundled DNA SDK (subprocess bridge) with the DNA Kit script for pid `9b4f0000`
+4. **SDKAuth** — Registers the cloud session with the DNA cloud (ECDH handshake) so devices accept our control key
+5. **Control/status** — `dnaControl` cloud-relay requests via the SDK; the plaintext wire payload is `[a5a55a5a][ck][cmd][0x0b][len][ver][JSON]` with DNA Kit parameter names (see `kelvinator_dna/protocol.py`)
 
 ## Installation (HACS)
 
@@ -81,81 +94,53 @@ Each AC unit creates these entities:
 │  ┌─────────────────────────────────────────────┐ │
 │  │ Kelvinator Integration                        │ │
 │  │                                              │ │
-│  │  ┌───────────────┐  ┌────────────────────┐  │ │
-│  │  │ config_flow.py│  │  coordinator.py    │  │ │
-│  │  │ (UI login)    │  │  (poll/refresh)    │  │ │
-│  │  └───────┬───────┘  └────────┬───────────┘  │ │
-│  │          │                   │               │ │
-│  │  ┌───────▼───────────────────▼────────────┐  │ │
-│  │  │ api.py                                  │  │ │
-│  │  │  ├─ KelvinatorCloudClient               │  │ │
-│  │  │  │   ├─ _cloud_login_sync()             │  │ │
-│  │  │  │   │   → bizaccount.ibroadlink.com    │  │ │
-│  │  │  │   └─ _cloud_discover_sync()          │  │ │
-│  │  │  │      → kelvinator_dna.cloud          │  │ │
-│  │  │  │         → bizihcv0.ibroadlink.com    │  │ │
-│  │  │  ├─ KelvinatorACDevice                  │  │ │
-│  │  │  │   └─ send_command / update_state     │  │ │
-│  │  │  └─ Relay (auto-selected)               │  │ │
-│  │  │      ├─ DNALocalRelay (default)         │  │ │
-│  │  │      │   → kelvinator_dna.device        │  │ │
-│  │  │      │      → UDP DNA protocol (LAN)    │  │ │
-│  │  │      └─ DNACloudRelay (fallback)        │  │ │
-│  │  │          → kelvinator_dna.so_bridge     │  │ │
-│  │  │             → libNetworkAPI.so           │  │ │
-│  │  └──────────────────┬──────────────────────┘  │ │
-│  │                     │                         │ │
-│  │  ┌──────────────────▼──────────────────────┐  │ │
-│  │  │ climate.py / switch.py / sensor.py       │  │ │
-│  │  └─────────────────────────────────────────┘  │ │
-│  └──────────────────────────────────────────────┘ │ │
-└──────────────────────┬───────────────────────────┘ │
-                       │ HTTPS (Cloud API)            │
-                       ▼                              │
-   ┌─────────────────────────────────────────────┐   │
-   │ BroadLink Cloud                              │   │
-   │  ├─ bizaccount.ibroadlink.com               │   │
-   │  │   → Account login (AES-encrypted)         │   │
-   │  └─ bizihcv0.ibroadlink.com                 │   │
-   │      → Device discovery, AES keys, passwords │   │
-   └─────────────────────────────────────────────┘   │
+│  │  config_flow.py → coordinator.py             │ │
+│  │        │                                      │ │
+│  │  api.py (cloud login + discovery)            │ │
+│  │        │                                     │ │
+│  │  dna_native.py  ──►  dna_sdk/dna_bridge.py   │ │
+│  │  (async bridge)       (subprocess, stdlib)   │ │
+│  │                          │                    │ │
+│  │                 kelvinator_native.so          │ │
+│  │                          │                    │ │
+│  │                 libNetworkAPI.so (x86-64)     │ │
+│  │                 + DNA Kit script (pid 9b4f)   │ │
+│  └──────────────────────┬────────────────────────┘ │
+└──────────────────────┬───┴──────────────────────────┘
+                       │ HTTPS / TCP relay
+                       ▼
+   ┌─────────────────────────────────────────────┐
+   │ BroadLink Cloud                              │
+   │  ├─ bizaccount.ibroadlink.com  (login)       │
+   │  ├─ bizihcv0.ibroadlink.com    (discovery)   │
+   │  └─ access.ibroadlink.com:1998 (ctrl relay)  │
+   └─────────────────────────────────────────────┘
 ```
-
-Control uses **local UDP** by default via the pure-Python DNA protocol stack
-bundled in `kelvinator_dna.device`. The cloud relay (`libNetworkAPI.so`) is only
-a fallback — the file is included in the repository but is not required.
-
-## How It Works
-
-1. **Login** — Authenticates against `bizaccount.ibroadlink.com` using AES-128-CBC encrypted credentials (matching the mobile app's login flow)
-2. **Discovery** — Retrieves device list, AES keys, and passwords from `bizihcv0.ibroadlink.com` via the bundled `kelvinator_dna.cloud` module
-3. **IP lookup** — Resolves each AC's LAN IP by checking the ARP table first, then falling back to subnet-directed UDP broadcast
-4. **Control** — Sends DNA protocol commands directly to the AC over UDP (LAN), using the pure-Python `kelvinator_dna.device` module
-5. **Status polling** — Queries device state on the configured poll interval via the same UDP path
-
-The bundled `kelvinator_dna` package contains a complete pure-Python implementation of the protocol stack — DNA packet framing, AES-128-ECB encryption, TFB serialization, and UDP device communication.
 
 ## Troubleshooting
 
-### Login fails during setup
+### Login fails during setup (`-1008`)
 
 - Verify you're using the **same credentials** as the Kelvinator mobile app
-- If using a phone number, set the country code to `61` (AU) or `64` (NZ)
-- Check the Home Assistant logs for specific error messages
+- If using a phone number, the integration sends it as-is; the account must be a phone account
+- `-1005` usually means the username field type was wrong (email vs phone)
 
 ### No devices discovered
 
 - Log into the Kelvinator app on your phone and verify your AC units appear there
 - The integration can only discover devices registered to your cloud account
-- Check logs for "Cloud returned 0 device(s)" — this means the Family API returned no devices
 
-### Commands don't work ("Cannot find LAN IP")
+### Commands rejected ("control key expired")
 
-- The integration resolves AC IPs from the system **ARP table** first (`/proc/net/arp`)
-- If the AC isn't in the ARP table, it falls back to subnet-directed UDP broadcast discovery
-- The AC must be on the **same broadcast domain** as Home Assistant for ARP/broadcast to work
-- Check logs for `"ARP found"` or `"UDP discovered"` messages to confirm IP resolution
-- If neither source works, verify the AC is powered on and connected to Wi-Fi
+- The DNA SDK's `SDKAuth` step registers your session with the BroadLink cloud.
+  Check the HA logs for the `DNA SDKAuth:` line at setup.
+- If SDKAuth failed, control will be rejected until it succeeds.
+
+### Platform support
+
+- The bundled SDK binary is **x86-64 only** (matching the official app's
+  x86_64 build). On ARM hosts (e.g. Raspberry Pi) control is disabled;
+  an arm64 build of the same SDK may be bundled later.
 
 ## Changelog
 
@@ -164,6 +149,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 ## License
 
 Licensed under the GNU General Public License v3.0 — see [LICENSE](LICENSE) for details.
+The bundled `libNetworkAPI.so` and DNA Kit script are proprietary BroadLink SDK
+components included for interoperability with devices the user owns.
 
 ---
 

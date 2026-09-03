@@ -5,9 +5,9 @@ LAN device discovery + local UDP control test for Kelvinator AC units.
 Usage:
   python testing/test_lan.py                        # interactive (prompts)
   python testing/test_lan.py --dry-run               # skip network, compile-check
-  KELVINATOR_USER=0400000000 KELVINATOR_PASS=... \
+  KELVINATOR_USER=<your-phone> KELVINATOR_PASS=... \
     python testing/test_lan.py                        # non-interactive
-  python testing/test_lan.py --ips 192.168.1.101     # specific IPs only
+  python testing/test_lan.py --ips 192.168.1.101    # specific IPs only
 
 Failure diagnostics are printed inline. Each stage reports pass/fail + details.
 """
@@ -331,8 +331,8 @@ def udp_status(ip: str, mac_str: str, did: str, aes_key_hex: str, password: int)
 def main():
     p = argparse.ArgumentParser(description="Kelvinator LAN device test")
     p.add_argument("--dry-run", action="store_true", help="Skip network, just verify imports")
-    p.add_argument("--ips", nargs="+", default=["192.168.1.101", "192.168.1.102", "192.168.1.103"],
-                   help="Direct-probe fallback IPs")
+    p.add_argument("--ips", nargs="+", default=[],
+                   help="Direct-probe fallback IPs (e.g. 192.168.1.101)")
     p.add_argument("--skip-cloud", action="store_true",
                    help="Skip cloud login — use hardcoded device credentials from HAR capture")
     args = p.parse_args()
@@ -351,21 +351,19 @@ def main():
 
     # Credentials
     if args.skip_cloud:
-        # HAR-captured credentials — no cloud login needed
-        devices = [
-            {"did":"00000000000000000000a1b2c3d4e5f6","mac":"a1:b2:c3:d4:e5:f6",
-             "name":"AC 1","aes_key":"00112233445566778899aabbccddeeff",
-             "password":100000001,"devtype":20379,"pid":"9b4f0000"},
-            {"did":"00000000000000000000a1b2c3d4e6f7","mac":"a1:b2:c3:d4:e6:f7",
-             "name":"AC 2","aes_key":"11223344556677889900aabbccddeeff",
-             "password":100000002,"devtype":20379,"pid":"9b4f0000"},
-            {"did":"00000000000000000000a1b2c3d4e7f8","mac":"a1:b2:c3:d4:e7:f8",
-             "name":"AC 3","aes_key":"223344556677889900aabbccddeeff",
-             "password":100000003,"devtype":20379,"pid":"9b4f0000"},
-        ]
-        print("\nUsing HAR-captured device credentials (skipping cloud)")
+        # Device credentials captured from your own HAR — never commit them.
+        # Provide via KELVINATOR_HAR_CREDS=/path/to/creds.json
+        #   Format: [{"did": ..., "mac": ..., "name": ..., "aes_key": ...,
+        #             "password": N, "devtype": 20379, "pid": "9b4f0000"}, ...]
+        har_path = os.environ.get("KELVINATOR_HAR_CREDS", "")
+        if not har_path or not os.path.exists(har_path):
+            print("  --skip-cloud needs KELVINATOR_HAR_CREDS pointing at a "
+                  "JSON file with your device credentials (see docstring).")
+            return
+        devices = json.load(open(har_path))
+        print(f"\nUsing device credentials from {har_path} (skipping cloud)")
         for d in devices:
-            print(f"  {d['name']}: mac={d['mac']} did={d['did'][:8]}... key={d['aes_key'][:8]}...")
+            print(f"  {d['name']}: mac={d['mac']} did={d['did'][:8]}...")
         ok = 2  # stages 1+2 skipped
         total = 2
     else:
@@ -438,7 +436,7 @@ def main():
         else:
             print("  FAIL: No devices found via broadcast or direct probe.")
             print("  Check: are devices on the same subnet? UDP port 80 reachable?")
-            print("  Try: ping 192.168.1.101")
+            print("  Try: ping <your-ac-ip>")
 
     # 4. UDP status for each device
     print("\n[4/4] Querying device status via UDP...")

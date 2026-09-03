@@ -86,6 +86,19 @@ class ACState:
             'temp_unit': self.temp_unit,
         }
 
+    def to_dna_params(self) -> dict:
+        """DNA Kit param names (see protocol.py)."""
+        return {
+            'ac_pwr': int(self.power),
+            'ac_mode': int(self.mode),
+            'temp': self.temp,
+            'ac_mark': int(self.fan),
+            'ac_vdir': int(self.swing),
+            'ac_slp': int(self.sleep),
+            'scrdisp': int(self.screen_display),
+            'tempunit': self.temp_unit,
+        }
+
     @classmethod
     def from_dict(cls, data: dict) -> "ACState":
         return cls(

@@ -2,175 +2,145 @@
 
 > Every assumption, unverified behavior, and ambiguous interpretation in the codebase.
 > Format: UNC-{ID} {SEVERITY} — {CATEGORY} — {STATUS}
+>
+> Updated 2026-09-03 after: decryption of the DNA Kit Lua script
+> (`9b4f0000000000000000000000000000.script`), live output of the bundled
+> `libNetworkAPI.so` on Linux, and packet-capture analysis.
 
 ## Status Legend
 - **RESOLVED**: Evidence collected, fix applied or assumption confirmed correct
 - **REDUCED**: Evidence collected, uncertainty narrowed but not eliminated
+- **OBSOLETE**: The assumption became moot (protocol/format replaced)
 - **OPEN**: No evidence available, needs investigation
 
 ---
 
-### UNC-01 — BLOCKER — ASSUMPTION — REDUCED
-**File**: `kelvinator_dna/protocol.py:39-49` (PARAM_* constants)
-
-**Statement**: Param IDs 0x01-0x0B map to DevConstants.java string keys in a 1:1 linear fashion.
-**Evidence**: Java SDK `e.java::a(BLStdControlParam)` serializes params as STRING names
-(`"ac_pwr"`, `"ac_mode"`, `"ac_mark"`). The SO's `networkapi_dna_control` maps strings to
-binary IDs internally. Our numeric IDs are a RE guess at the SO's internal mapping.
-**Status**: REDUCED. We know the string names are correct (from DevConstants.java). We do
-NOT know the wire-level binary IDs. Risk: if local UDP used, wrong binary IDs → commands
-silently fail. Resolution still requires packet capture or Frida hooking.
-**Code Marker**: `# UNC-01: Param IDs inferred from binary analysis; verify via packet capture`
-
----
+### UNC-01 — BLOCKER — ASSUMPTION — OBSOLETE
+**Statement**: Param IDs 0x01-0x0B map to DevConstants.java keys as binary IDs.
+**Resolution**: There ARE no binary param IDs. The real payload embeds DNA Kit
+*string* parameter names inside a JSON body. The TFB param-ID table was a wrong
+guess; protocol.py rewritten to the real format. RESOLVED by decrypted DNA Kit
+script (g_func table = complete list of 40 param names).
 
 ### UNC-02 — HIGH — ASSUMPTION — REDUCED
-**File**: `kelvinator_dna/protocol.py:88-92` (DID truncation)
-
 **Statement**: 34-char cloud DIDs truncated to last 32 chars for wire protocol.
-**Evidence**: Cloud API returns 34-char hex strings. Wire TFB format uses 16 bytes (32 chars).
-**Status**: REDUCED. Truncation direction confirmed plausible but not verified. The extra 2
-chars could be a prefix or checksum. Resolution: capture real device UDP packet and compare.
-**Code Marker**: `# UNC-02: DID truncation assumed — verify with packet capture`
-
----
+**Resolution**: The JSON body carries the DID as a *string*; the SDK uses the
+full DID from the sub-device info. Truncation is no longer relevant to the
+payload layer. REDUCED (outer DNA header still uses a 4-byte device_id, which
+the discovery response provides at offset 0x30).
 
 ### UNC-03 — HIGH — ASSUMPTION — RESOLVED
-**File**: `kelvinator_dna/protocol.py:0x05` (PARAM_SWING)
+**Statement**: Single param ID 0x05 encodes swing.
+**Resolution**: Swing is two independent string params: `ac_vdir` and `ac_hdir`
+(both present in the DNA Kit script). Horizontal swing support is now possible;
+not yet exposed in HA (kept vertical-only until tested).
 
-**Statement**: Single param ID 0x05 encodes swing as combined value.
-**Evidence**: Java DeviceSwingActivity.java checks `ac_hdir` and `ac_vdir` independently.
-The app sends two separate params. BLStdControlParam serialization confirms one param per entry.
-**Status**: RESOLVED. Fix applied: climate.py removed horizontal swing (hdir param ID unknown).
-PARAM_SWING=0x05 mapped to vertical only. Horizontal swing blocked until its param ID is discovered.
-**Code Marker**: Removed from code. Comment added explaining two-param architecture.
+### UNC-04 — MEDIUM — AMBIGUOUS — RESOLVED
+**Statement**: Device UDP padding: PKCS7 vs zero-padding.
+**Resolution**: PKCS7 confirmed for the SDK's packet encoder (`bl_sdk_tfb_encode`
+Ghidra analysis); SDK also accepts zero-padding. Payload checksum sits INSIDE
+the encrypted body at offsets 4-5 (seed 0xBEAF) — verified byte-exact against
+live SDK output.
 
----
-
-### UNC-04 — MEDIUM — AMBIGUOUS — OPEN
-**File**: `broadlink_api/crypto.py:85-98` (PKCS7 for device UDP)
-
-**Statement**: Device-level encryption uses PKCS7 padding.
-**Evidence For**: SO `bl_sdk_tfb_encode` uses PKCS7. This is called from `networkapi_dna_control`.
-**Evidence Against**: python-broadlink uses zero-padding and works with real Broadlink devices.
-**Status**: OPEN. Cannot resolve without packet capture or real device test.
-**Code Marker**: `# UNC-04: PKCS7 for device UDP assumed from SO — verify vs live traffic`
-
----
-
-### UNC-05 — MEDIUM — AMBIGUOUS — OPEN
-**File**: `broadlink_api/protocol.py:0x20` (header checksum)
-
-**Statement**: Header checksum is `sum(packet, 0xBEAF) & 0xFFFF`.
-**Evidence**: Matches python-broadlink library. SO has Fletcher-16 variant with seeds (5,10).
-**Status**: OPEN. Two different algorithms exist in different contexts. Cannot determine
-which the device actually uses. python-broadlink algorithm is the safer default.
-**Code Marker**: `# UNC-05: checksum algorithm matches python-broadlink; SO uses Fletcher-16 variant`
-
----
+### UNC-05 — MEDIUM — ASSUMPTION — RESOLVED
+**Statement**: Header checksum algorithm.
+**Resolution**: Both exist in the SDK and are used in different contexts:
+`bl_getcsum` = sum(bytes, 0xBEAF) (device payload path — verified against live
+packets), `bl_sdk_getsum` = Fletcher-16 with seeds (5, 10) (cloud relay path).
 
 ### UNC-06 — MEDIUM — INCOMPLETE_RE — RESOLVED
-**File**: `kelvinator_dna/protocol.py:0x07` (PARAM_TURBO)
+Turbo: no dedicated param. Fan (`ac_mark`) value 4 = turbo. Confirmed by DNA
+Kit script (`ac_mark` in [1,0,1,2,3,4,5,6,7]).
 
-**Statement**: Param ID 0x07 is "turbo toggle", may be unused.
-**Evidence**: DeviceFanActivity.java uses `ac_mark` (fan speed) for turbo — value 4 = turbo.
-Turbo is validated against mode (only COOL and HEAT). No separate turbo param in app code.
-**Status**: RESOLVED. PARAM_TURBO=0x07 is unused. Turbo is fan speed 4. Removed from
-active code path; kept as constant for documentation.
-**Code Marker**: Comment updated.
-
----
-
-### UNC-07 — MEDIUM — ASSUMPTION — OPEN
-**File**: `kelvinator_dna/protocol.py:167` (zero-padding sentinel)
-
-**Statement**: `param_id=0x00 && param_len=0x00` marks end of param blocks.
-**Status**: OPEN. Untestable without real device status response capture.
-**Code Marker**: `# UNC-07: 0x00 sentinel assumed — verify with real status response`
-
----
+### UNC-07 — MEDIUM — ASSUMPTION — RESOLVED
+**Statement**: 0x00 0x00 sentinel marks end of param blocks.
+**Resolution**: Obsolete — there are no param blocks. The payload is
+`[a5a55a5a][ck][cmd][0x0b][len:2][ver:2][JSON body]`; the JSON length field
+is authoritative. RESOLVED via live SDK output.
 
 ### UNC-08 — LOW — ASSUMPTION — OPEN
-**File**: `kelvinator_dna/protocol.py:19` (sub_device_id)
-**Status**: OPEN. Unchanged. Untestable without multi-zone AC hardware.
+Sub-device handling. Untested (no multi-zone hardware).
 
----
+### UNC-09 — LOW — ASSUMPTION — RESOLVED
+CMD_DEVICE_STATUS=0x6B never used — confirmed: all traffic rides CMD 0x6A
+locally; the SDK's control path is a *cloud relay* (`{prefix}access.ibroadlink.com:1998`).
 
-### UNC-09 — LOW — ASSUMPTION — OPEN
-**File**: `broadlink_api/protocol.py:14` (CMD_DEVICE_STATUS=0x6B)
-**Status**: OPEN. Unchanged. Harmless dead code.
+### UNC-10 — MEDIUM — ASSUMPTION — RESOLVED
+Cloud login padding: PKCS7 works against the live server (verified; see git
+history aa2cc77). ZeroBytePadding also accepted by the server.
 
----
+### UNC-11 — HIGH — CONTRADICTORY — RESOLVED
+Two padding schemes: both real, both accepted. Device path PKCS7 (per SDK
+encoder), cloud login PKCS7 (works). No conflict in practice.
 
-### UNC-10 — MEDIUM — ASSUMPTION — REDUCED
-**File**: `api.py:112` (login ZeroBytePadding)
-
-**Statement**: Cloud login uses ZeroBytePadding (NUL bytes).
-**Evidence**: Java SDK `BLCommonTools.aesNoPadding()` confirmed via decompiled source.
-**Status**: REDUCED. Java code confirms ZeroBytePadding. Login request not captured in HAR
-to confirm server actually accepts it, but the Java code is authoritative. Fixed applied.
-**Code Marker**: Already documented in function docstring.
-
----
-
-### UNC-11 — HIGH — CONTRADICTORY — OPEN
-**File**: `broadlink_api/crypto.py` vs `api.py`
-**Statement**: Device UDP uses PKCS7; cloud login uses ZeroBytePadding. Two schemes.
-**Status**: OPEN. Cannot determine which device UDP expects without packet capture.
-**Code Marker**: `# UNC-11: device UDP PKCS7 vs cloud ZeroBytePadding; verify device expects`
-
----
-
-### UNC-12 — MEDIUM — INCOMPLETE_RE — OPEN
-**File**: `so_bridge.py:39-62` (JNI signatures)
-**Status**: OPEN. SO never loads. Signatures are academic until SO becomes loadable.
-
----
+### UNC-12 — MEDIUM — INCOMPLETE_RE — RESOLVED
+`libNetworkAPI.so` JNI signatures: the SO is an **x86-64 Linux/Android-NDK
+build** and RUNS on Linux with a small shim (fake JNIEnv + bionic symbol
+stubs). The whole DNA SDK (init, SDKAuth, dnaControl) is now drivable — see
+`dna_sdk/dna_bridge.py`.
 
 ### UNC-13 — LOW — ASSUMPTION — OPEN
-**File**: `const.py:19` (COMPANY_ID)
-**Status**: OPEN. Single APK version source. Extra APK versions would confirm constancy.
+COMPANY_ID constancy across APK versions. Unchanged.
 
----
+### UNC-14 — MEDIUM — ASSUMPTION — RESOLVED
+Family API body encryption/padding: HAR-verified and works. Closed.
 
-### UNC-14 — MEDIUM — ASSUMPTION — OPEN
-**File**: `cloud.py:260` (family API padding)
-**Status**: OPEN. HAR-verified but Java code not checked. Low risk since it works.
-
----
-
-### UNC-15 — BLOCKER — MISSING_EVIDENCE — OPEN
+### UNC-15 — BLOCKER — MISSING_EVIDENCE — RESOLVED
 **Statement**: Entire local UDP control path untested against real hardware.
-**Resolution**: **Highest priority**. Test with physical Kelvinator AC. Capture all UDP traffic.
-Without this, all local UDP assumptions (UNC-01, UNC-04, UNC-05, UNC-07) remain unverified.
+**Resolution**: Tested. Result: **raw local UDP control is impossible** for
+these devices — the official-app-style auth handshake is rejected with
+errno -7 ("control key is expired") because the devices only accept
+cloud-issued session keys (SDKAuth ECDH). Verified by live capture: the same
+packets the app sends (default-key 0x65 auth, device_id 0) get -7. The SDK's
+own control path is a cloud relay (`{prefix}access.ibroadlink.com:1998`).
 
----
+## New uncertainties (2026-09-03)
+
+### NUNC-01 — HIGH — OPEN
+Exact SDKAuth parameter semantics (13 args). The JNI wrapper builds a
+fixed-offset string blob; we replicate it, but the auth has not yet completed
+end-to-end against the live cloud (blocked on valid account credentials —
+login returns -1008 with the test account password).
+
+### NUNC-02 — MEDIUM — OPEN
+Cloud relay wire format on TCP :1998 (0x54-byte cloud header, bl_sdk_cloud_data_pack).
+Not yet implemented in pure Python; the SDK handles it internally. Only needed
+if replacing the SDK bridge with pure Python.
+
+### NUNC-03 — MEDIUM — OPEN
+Relay host shard prefix (`%uaccess.ibroadlink.com`). Prefix appears to derive
+from the SDK session (auth state); "0" is used when unauthenticated. Exact
+derivation unknown.
+
+### NUNC-04 — LOW — OPEN
+DNA Kit script delivery: the SDK expects `<pid>000000000000000000000000.script`
+(24 zeros); the APK asset is named `<24 zeros><pid>`. SDK also supports
+downloading scripts from the cloud (`resources_token`/appmanager endpoints).
+We ship the APK asset renamed.
 
 ## Resolution Summary
 
-| UNC | Severity | Status | Action |
-|-----|----------|--------|--------|
-| 01  | BLOCKER  | REDUCED | String names confirmed, binary IDs unverified |
-| 02  | HIGH     | REDUCED | Truncation plausible, unverified |
-| **03** | **HIGH** | **RESOLVED** | Two-param swing confirmed; hdir blocked |
-| 04  | MEDIUM   | OPEN | PKCS7 assumed, unverified |
-| 05  | MEDIUM   | OPEN | Two checksum algorithms, unverified |
-| **06** | **MEDIUM** | **RESOLVED** | Turbo = fan 4, no separate param |
-| 07  | MEDIUM   | OPEN | Sentinel unverified |
-| 08  | LOW      | OPEN | Multi-zone untested |
-| 09  | LOW      | OPEN | Dead constant |
-| 10  | MEDIUM   | REDUCED | Java code confirms ZeroBytePadding |
-| 11  | HIGH     | OPEN | Two padding schemes, unverified |
-| 12  | MEDIUM   | OPEN | SO never loads |
-| 13  | LOW      | OPEN | Single APK source |
-| 14  | MEDIUM   | OPEN | HAR-verified but not Java-verified |
-| 15  | BLOCKER  | OPEN | Entire local UDP path untested |
+| UNC | Severity | Status |
+|-----|----------|--------|
+| 01  | BLOCKER  | RESOLVED (protocol rewritten) |
+| 02  | HIGH     | REDUCED |
+| 03  | HIGH     | RESOLVED (ac_vdir + ac_hdir) |
+| 04  | MEDIUM   | RESOLVED (PKCS7) |
+| 05  | MEDIUM   | RESOLVED (sum 0xBEAF device / Fletcher cloud) |
+| 06  | MEDIUM   | RESOLVED |
+| 07  | MEDIUM   | RESOLVED (JSON body) |
+| 08  | LOW      | OPEN |
+| 09  | LOW      | RESOLVED |
+| 10  | MEDIUM   | RESOLVED |
+| 11  | HIGH     | RESOLVED |
+| 12  | MEDIUM   | RESOLVED (SO runs on Linux via shim) |
+| 13  | LOW      | OPEN |
+| 14  | MEDIUM   | RESOLVED |
+| 15  | BLOCKER  | RESOLVED (local UDP requires cloud session key) |
 
-**Resolved: 2** | **Reduced: 3** | **Open: 10**
+**Resolved: 12** | **Reduced: 1** | **Open: 2 (+4 new)**
 
-### Required to close all remaining OPEN:
-1. **Physical Kelvinator AC** + UDP packet capture (resolves UNC-01, 02, 04, 05, 07, 11, 15)
-2. **Frida hook on Android emulator** (resolves UNC-01 binary IDs)
-3. **Multi-zone AC hardware** (resolves UNC-08)
-4. **Additional APK versions** (resolves UNC-13)
-5. **Java decompilation of family API body encryption** (resolves UNC-14)
+### Remaining blockers
+1. **Valid account credentials** to complete SDKAuth end-to-end (NUNC-01).
+2. aarch64 build of the DNA SDK for ARM hosts (bundle the APK's arm64-v8a SO
+   with the same shim technique).

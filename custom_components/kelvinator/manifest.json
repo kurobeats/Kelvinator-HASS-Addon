@@ -1,17 +1,18 @@
 {
-    "domain": "kelvinator",
-    "name": "Kelvinator Home Comfort",
-    "codeowners": ["@ants"],
-    "config_flow": true,
-    "dependencies": [],
-    "documentation": "https://github.com/kurobeats/Kelvinator-HASS-Addon",
-    "integration_type": "hub",
-    "iot_class": "local_polling",
-    "issue_tracker": "https://github.com/kurobeats/Kelvinator-HASS-Addon/issues",
-    "requirements": [
-        "pycryptodome>=3.19.0",
-        "broadlink>=0.19"
-    ],
-    "ssdp": [],
-    "version": "2.0.0"
+  "domain": "kelvinator",
+  "name": "Kelvinator Home Comfort",
+  "codeowners": [
+    "@ants"
+  ],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/kurobeats/Kelvinator-HASS-Addon",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/kurobeats/Kelvinator-HASS-Addon/issues",
+  "requirements": [
+    "pycryptodome>=3.19.0"
+  ],
+  "ssdp": [],
+  "version": "2.1.0"
 }

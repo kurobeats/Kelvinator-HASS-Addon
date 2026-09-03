@@ -1,125 +1,103 @@
 # Kelvinator DNA Protocol Documentation
 
-Reverse-engineered from the Kelvinator/Electrolux Android APK (com.kelvinator.airconditioner).
+Reverse-engineered from the Kelvinator/Electrolux Android APK (com.kelvinator.airconditioner),
+the bundled `libNetworkAPI.so` (x86-64 DNA SDK build, runs on Linux via a shim),
+and the **decrypted DNA Kit Lua script** for pid `9b4f0000`.
 
 ## Architecture
 
 ```
-Cloud API (HTTPS)                    Local UDP (DNA Protocol)
-├── account/login ──── login ────┐  ├── Discovery (broadcast :80)
-├── ec4/v1/common/api ── api key │  ├── Auth (CMD_AUTH 0x65)
-├── user/getfamilyid ── family ──┤  ├── Control (CMD_DEVICE_CONTROL 0x6A)
-└── family/getallinfo ── devices ┘  └── Status query (same 0x6A, TFB type=0x02)
-         │                                    │
-         ├── did, mac, aes_key, password ─────┘
-         │
-         └── (device IPs from LAN broadcast discovery)
+Cloud API (HTTPS)                        Device control path
+├── account/login (bizaccount)           ├── DNA SDK (libNetworkAPI.so)
+├── ec4/v1/common/api  → API key         │   SDKInit → SDKAuth (TLS+ECDH)
+├── user/getfamilyid                     │   dnaControl → cloud relay
+└── family/getallinfo → did, mac,        │       {prefix}access.ibroadlink.com:1998
+                        aes_key, password │   or local UDP (requires session key)
+                                          ├── DNA Kit Lua script (pid 9b4f0000)
+                                          │   defines param names + payload format
+                                          └── plaintext payload:
+                                              [a5a55a5a][ck:2][cmd][0x0b][len:2][ver:2][JSON]
 ```
 
-## DNA Protocol (Broadlink 0x38-byte header)
+## Wire Payload (GROUND TRUTH — from the DNA Kit script)
 
-Source: `../custom_components/kelvinator/broadlink_api/protocol.py`
+The payload that rides inside the Broadlink 0x38-header/AES packet:
 
-| Offset | Size | Field |
-|--------|------|-------|
-| 0x00 | 8 | Magic: `5A A5 AA 55 5A A5 AA 55` |
-| 0x08 | 4 | Reserved |
-| 0x0C | 4 | Packet type |
-| 0x10 | 2 | Length (LE) |
-| 0x12 | 2 | Reserved |
-| 0x14 | 4 | Reserved |
-| 0x18 | 4 | Count |
-| 0x1C | 4 | Unknown |
-| 0x20 | 2 | Header checksum (sum of entire packet, seed 0xBEAF) |
-| 0x22 | 2 | Error code (0 = success) |
-| 0x24 | 2 | Device type (0x4F9B = 20379 for AC) |
-| 0x26 | 2 | Command |
-| 0x28 | 2 | Count |
-| 0x2A | 6 | MAC address |
-| 0x30 | 4 | Device ID (LE) |
-| 0x34 | 2 | Payload checksum |
-| 0x36 | 2 | Reserved |
+```
+[0:4]   a5 a5 5a 5a   magic
+[4:6]   checksum LE   sum(bytes) with [4:6] zeroed, seed 0xBEAF
+[6]     0x01 = get, 0x02 = set
+[7]     0x0b          protocol tag
+[8:10]  body len LE
+[10:12] version LE    (0)
+[12:]   JSON body
+```
+
+Request body: `{"<param>": <val>, ..., "did": "<did>"}` — params are DNA Kit
+STRING names: `ac_pwr, ac_mode, temp, ac_mark, ac_vdir, ac_hdir, ac_slp,
+scrdisp, ecomode, envtemp (RO), ac_errcode (RO), tempunit, anionmode, drmode,
+espmode, filreset, insectrepellent, mldprf, qtmode, timer, ac_timingtime,
+modelnumber, sn, …` (full list: `kelvinator_dna/protocol.py::DNA_KIT_PARAMS`).
+
+Source of truth: `custom_components/kelvinator/kelvinator_dna/protocol.py`
+(self-checks against live SDK output).
 
 ## Encryption
 
-- **Algorithm**: AES-128-CBC
-- **Padding**: Zero-padding (NUL bytes to 16-byte boundary)
-- **IV**: `562e17996d093d28ddb3ba695a2e6f58` (Broadlink standard)
-- **Key**: Device AES key from cloud API (32-char hex = 16 bytes)
-- **Checksum**: 2-byte LE sum prepended before encryption, seed 0xBEAF
-
-After decryption, strip the first 2 bytes (checksum) and last NUL-padding bytes.
-
-### Cloud API Encryption
-- **Family API**: Same AES-128-CBC, zero-padding to `(len//16 + 2) * 16` bytes
-- **IV**: `EA AA AA 3A BB 58 62 A2 19 18 B5 77 1D 16 15 AA`
-- **Key**: Server key from `/ec4/v1/common/api` response
-
-## TFB Payload Format (AC Commands)
-
-Source: `../custom_components/kelvinator/kelvinator_dna/protocol.py`
-
-```
-[did:16 bytes]          — Device ID (32 hex chars = 16 bytes; cloud DIDs are 34 chars, use last 32)
-[sub_device_id:2 LE]    — Sub-device index (0 for main unit)
-[command_type:1]        — 0x01 = set control, 0x02 = query status
-[param_id:1][len:1][val:N] — Repeated parameter blocks
-```
-
-### Known Parameter IDs
-
-| ID | Name | Type | Values |
-|----|------|------|--------|
-| 0x01 | power | bool | 0=off, 1=on |
-| 0x02 | mode | int | 0=cool, 1=heat, 2=dry, 3=fan, 4=auto, 5=eco, 6=eight_heat, 7=twelve_heat |
-| 0x03 | temp | int | 16-30°C |
-| 0x04 | fan | int | 0=auto, 1=low, 2=med, 3=high, 4=turbo, 5=quiet, 6=low_med, 7=med_high |
-| 0x05 | swing | int | 0=off, 1=vert, 2=horiz, 3=both |
-| 0x06 | sleep | bool | 0=off, 1=on |
-| 0x07 | turbo | bool | (may be unused — turbo is a fan level) |
-| 0x08 | temp_unit | int | 0=°C, 1=°F |
-| 0x09 | room_temp | int | (read-only, from status response) |
-| 0x0a | error_code | int | (read-only) |
-| 0x0b | screen_display | bool | 0=display off, 1=display on |
-
-**⚠️ UNTESTED**: These param IDs were inferred from binary analysis of `libNetworkAPI.so`. They have NOT been validated against live device traffic. See `ghidra_findings.md` for verification plan.
+- **Device path**: AES-128-CBC, IV `562e17996d093d28ddb3ba695a2e6f58`, PKCS7,
+  key = per-device cloud `aes_key`. Payload checksum inside ciphertext at [4:6].
+- **Cloud family API**: AES-128-CBC, IV `EA AA AA 3A BB 58 62 A2 19 18 B5 77 1D 16 15 AA`,
+  zero-pad to `(len//16 + 2) * 16`, key from `/ec4/v1/common/api`.
+- **Checksums**: device payload = sum(bytes, 0xBEAF) (`bl_getcsum`);
+  cloud relay = Fletcher-16 seeds (5,10) (`bl_sdk_getsum`).
 
 ## Cloud API Endpoints
-
-Source: `BLApiUrls.java` from decompiled APK
 
 | Endpoint | Purpose |
 |----------|---------|
 | `{license}bizaccount.ibroadlink.com/account/login` | User authentication |
-| `{license}bizihcv0.ibroadlink.com/ec4/v1/common/api` | Get API key + server timestamp |
-| `{license}bizihcv0.ibroadlink.com/ec4/v1/user/getfamilyid` | Get family/home IDs |
-| `{license}bizihcv0.ibroadlink.com/ec4/v1/family/getallinfo` | Get all devices with AES keys |
-| `{license}thirdpartyservice.ibroadlink.com/thirdparty/v1/timetask/*` | Schedule management |
+| `{license}bizihcv0.ibroadlink.com/ec4/v1/common/api` | API key + timestamp |
+| `{license}bizihcv0.ibroadlink.com/ec4/v1/user/getfamilyid` | Family IDs |
+| `{license}bizihcv0.ibroadlink.com/ec4/v1/family/getallinfo` | Devices + AES keys |
+| `{prefix}access.ibroadlink.com:1998` | DNA control relay (SDK) |
+| `{license}auth.ibroadlink.com` | DNA SDKAuth (TLS/ECDH session) |
 
-## libNetworkAPI.so JNI Exports
+## Critical Finding: Locked Devices
 
-Source: `../custom_components/kelvinator/kelvinator_dna/so_bridge.py`
+These Kelvinator ACs reject the classic Broadlink local auth handshake with
+**errno -7 ("control key is expired")** — verified with live captures of the
+exact packets the official app sends (0x65 auth, default key, device_id 0).
+Local control requires a cloud-issued control key obtained via the SDK's
+`SDKAuth` (TLS + ECDH) flow. The integration therefore drives the vendor SDK
+binary (`dna_sdk/`) for control; pure-Python local UDP is impossible without
+reimplementing SDKAuth.
 
-| JNI Export | Args | Purpose |
-|------------|------|---------|
-| `SDKInit` | (String configJson) | Initialize SDK |
-| `dnaControl` | (String devInfo, String subDevInfo, String data, String cmdDesc) | Device control |
-| `deviceStatusOnServer` | (String config, String did) | Cloud relay status |
-| `deviceProbe` | (String did) | LAN device probe |
-| `devicePair` | (String did, String config) | Device pairing |
-| `deviceProfile` | (String did, String pid, String version) | Device profile |
-| `LicenseInfo` | (String license) | License information |
+## libNetworkAPI.so on Linux
 
-## Known Limitations
+The shipped SO is the SDK's **x86-64** build (DNASDK/linux, version
+`2.0.49-6566c07`). It runs on glibc with:
+- fake `JNIEnv` vtable (GetStringUTFChars/NewStringUTF pass-through)
+- bionic symbol shims: `__android_log_*`, `__sF`, `__errno`, `__assert2`
+- ELF tweaks: verneed `LIBC`/`LIBM` entries marked WEAK; INIT_ARRAYSZ=0
 
-1. **libNetworkAPI.so won't load on Linux/HA OS** — Android ARM binary, missing bionic libc/liblog.so
-2. **Local UDP path not wired into HA** — `kelvinator_dna/device.py::KelvinatorDevice` exists but is only used by CLI
-3. **TFB param IDs unverified** — need live device packet capture or Frida hooking
-4. **HAR capture incomplete** — login request and device control not captured
+Wrapped by `dna_sdk/kelvinator_native.so` (built from `native_wrap.c`,
+compile: `gcc -shared -fPIC -o kelvinator_native.so native_wrap.c -L. -l:libNetworkAPI.so -w`)
+and driven as a subprocess by `dna_bridge.py`.
 
-## Next Steps (RE)
+`dnaControl` JSON contract (validated against the SO):
+- devInfo: `{did, mac ("aa:bb:.."), aes_key, password, pid, devtype, magiccode, ip, port}`
+- subDevInfo: `{did, pid, name}`
+- data: `{"act":"get"|"set","params":[names],"vals":[[{"val":n}], ...]}` (sizes must match)
+- desc: `{"name":"dev_ctrl"|"dev_data","command":same,"cookie":"<hex>"}`
 
-1. Capture real app's UDP traffic with tcpdump/Wireshark between phone and AC unit
-2. Compare wire-format payloads to `build_control_payload()` output
-3. Frida-hook `NetworkAPI.dnaControl()` on Android emulator for exact argument values
-4. If param IDs confirmed, wire `KelvinatorDevice` (local UDP) into HA coordinator
+`dev_data` (build-only) returns `data.ctrldata` base64; `dev_ctrl` relays via
+the cloud (needs SDKAuth session; prefix `0access...` fails DNS otherwise).
+
+## Key files
+
+- `custom_components/kelvinator/kelvinator_dna/protocol.py` — payload format + self-check
+- `custom_components/kelvinator/dna_sdk/` — SDK binary, shim, bridge, DNA Kit script
+- `custom_components/kelvinator/dna_native.py` — async bridge client
+- `working_doco/uncertainty_audit.md` — assumption ledger (mostly resolved)
+- `testing/test_lan.py` — live LAN test harness
+- `tests/local_control_feasibility.md` — why local-only control is blocked
