@@ -9,3 +9,5 @@ custom_components/kelvinator/dna_sdk/libdl.so
 custom_components/kelvinator/dna_sdk/libm.so
 custom_components/kelvinator/dna_sdk/libstdc++.so
 custom_components/kelvinator/dna_sdk/libz.so
+.pi/
+.pi-subagents/
